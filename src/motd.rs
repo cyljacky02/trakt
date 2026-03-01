@@ -63,8 +63,21 @@ impl MOTDReflector {
         for source in sources.into_iter() {
             let local_addr = local_addr.clone();
             join_set.spawn(async move {
-                let result = ping::ping(&local_addr, &source, proxy_protocol, timeout).await;
-                (source, result)
+                // Try with proxy protocol first
+                if proxy_protocol {
+                    if let Ok(motd) =
+                        ping::ping(&local_addr, &source, true, timeout).await
+                    {
+                        return (source, Ok(motd));
+                    }
+                    // Fallback: try without proxy protocol (Geyser sometimes
+                    // ignores proxy-protocol-wrapped UnconnectedPing)
+                    let result = ping::ping(&local_addr, &source, false, timeout).await;
+                    (source, result)
+                } else {
+                    let result = ping::ping(&local_addr, &source, false, timeout).await;
+                    (source, result)
+                }
             });
         }
         // Take first successful result
@@ -81,5 +94,6 @@ impl MOTDReflector {
                 }
             }
         }
+        tracing::warn!("All MOTD sources failed — clients will see fallback MOTD");
     }
 }

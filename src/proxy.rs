@@ -573,12 +573,19 @@ impl RaknetProxy {
                 motd.port_v4 = self.in_bound_port;
                 motd.port_v6 = motd.port_v4;
                 if motd.lines[0].is_empty() {
-                    // motd reply has no effect with an empty title
                     motd.lines[0] = "...".into();
                 }
                 motd.encode_payload()
             }
-            None => String::new(),
+            None => {
+                // No MOTD fetched yet — send a minimal valid pong so the
+                // server still appears in the client's server list.
+                format!(
+                    "MCPE;{};{};{};0;0;{};{};Survival;1;{};{};",
+                    "Connecting...", 0, "", server_uuid, "",
+                    self.in_bound_port, self.in_bound_port
+                )
+            }
         };
 
         let pong = MessageUnconnectedPong {
