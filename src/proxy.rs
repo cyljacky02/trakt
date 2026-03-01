@@ -86,8 +86,6 @@ struct RaknetClient {
     proxy_udp_sock: Arc<UdpSocket>,
     /// UDP socket for Proxy <-> Server traffic (connected to backend).
     udp_sock: UdpSocket,
-    /// Cached local socket address of `udp_sock`.
-    udp_sock_addr: SocketAddr,
     /// Connection stage.
     stage: AtomicU8,
 
@@ -463,20 +461,19 @@ impl RaknetProxy {
 
         let sock = UdpSocket::bind(&proxy_bind).await?;
         sock.connect(server.addr).await?;
-        let udp_sock_addr = sock.local_addr()?;
+        let local_addr = sock.local_addr()?;
 
         let (tx, rx) = mpsc::channel(1);
         let span = tracing::info_span!(
             "session",
             client_addr = %addr,
             server_addr = %server.addr,
-            local_addr = %udp_sock_addr,
+            %local_addr,
         );
         let client = Arc::new(RaknetClient {
             addr,
             server,
             proxy_udp_sock: self.in_udp_sock.clone(),
-            udp_sock_addr,
             udp_sock: sock,
             stage: AtomicU8::new(stage),
             close_tx: tx,

@@ -70,8 +70,6 @@ pub struct RateLimiter {
     min_packet_size: usize,
     /// Maximum valid packet size in bytes.
     max_packet_size: usize,
-    /// Maximum packets per second per connected session.
-    session_pps_limit: u32,
 }
 
 /// Result of a rate limit check.
@@ -107,7 +105,6 @@ impl RateLimiter {
             ban_duration: Duration::from_secs(config.ban_duration_secs),
             min_packet_size: config.min_packet_size,
             max_packet_size: config.max_packet_size,
-            session_pps_limit: config.per_session_pps,
         }
     }
 
@@ -202,11 +199,6 @@ impl RateLimiter {
         if let Some(mut state) = self.ip_state.get_mut(&ip) {
             state.handshake_failures = 0;
         }
-    }
-
-    /// Returns the per-session pps limit.
-    pub fn session_pps_limit(&self) -> u32 {
-        self.session_pps_limit
     }
 
     /// Periodic cleanup of stale entries (call every ~30s from a background task).
