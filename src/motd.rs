@@ -63,9 +63,15 @@ impl MOTDReflector {
         for source in sources.into_iter() {
             let local_addr = local_addr.clone();
             join_set.spawn(async move {
-                // Always ping without proxy protocol for MOTD.
-                // UnconnectedPing is pre-session — Geyser doesn't need real
-                // client IP, and its ping passthrough is buggy with PP enabled.
+                // Try with proxy protocol first (required if backend has
+                // enable-proxy-protocol: true). Fall back to raw ping if
+                // that fails — handles backends that don't use proxy protocol,
+                // or Geyser builds with buggy PP ping passthrough.
+                if proxy_protocol {
+                    if let Ok(motd) = ping::ping(&local_addr, &source, true, timeout).await {
+                        return (source, Ok(motd));
+                    }
+                }
                 let result = ping::ping(&local_addr, &source, false, timeout).await;
                 (source, result)
             });
