@@ -166,7 +166,7 @@ impl RaknetProxy {
     ) -> std::io::Result<Arc<Self>> {
         let in_udp_sock = UdpSocket::bind(in_addr).await?;
         let in_bound_port = in_udp_sock.local_addr()?.port();
-        let server_uuid = rand::thread_rng().gen();
+        let server_uuid = rand::thread_rng().r#gen();
         let motd_reflector = Arc::new(MOTDReflector::new(config_provider.clone()));
         let health_controller = Arc::new(HealthController::new(config_provider.clone()));
         let load_balancer =
