@@ -76,21 +76,14 @@ impl HealthController {
     }
 
     /// Performs a health check on server.
-    async fn check_health(local_addr: String, proxy_protocol: bool, server: Arc<BackendServer>) {
+    async fn check_health(local_addr: String, _proxy_protocol: bool, server: Arc<BackendServer>) {
         let timeout = Duration::from_secs(5);
-        let success = if proxy_protocol {
-            // Try with proxy protocol first, fallback to without
-            ping::ping(&local_addr, &server.addr, true, timeout)
-                .await
-                .is_ok()
-                || ping::ping(&local_addr, &server.addr, false, timeout)
-                    .await
-                    .is_ok()
-        } else {
-            ping::ping(&local_addr, &server.addr, false, timeout)
-                .await
-                .is_ok()
-        };
+        // Always ping without proxy protocol for health checks.
+        // UnconnectedPing is pre-session — backend doesn't need real client IP,
+        // and Geyser's ping passthrough is buggy with proxy protocol enabled.
+        let success = ping::ping(&local_addr, &server.addr, false, timeout)
+            .await
+            .is_ok();
         let mut health = server.health.write().await;
         let prev_alive = health.alive;
         if success {
