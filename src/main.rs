@@ -55,9 +55,7 @@ fn main() {
             Ok(fdlimit::Outcome::LimitRaised { from, to }) => {
                 log::info!("Raised ulimit from {} to {}", from, to);
             }
-            Ok(fdlimit::Outcome::LimitNotRaised { limit }) => {
-                log::info!("Ulimit already at {}", limit);
-            }
+            Ok(_) => log::info!("Ulimit unchanged"),
             Err(err) => log::warn!("Failed to raise ulimit: {}", err),
         }
     }
