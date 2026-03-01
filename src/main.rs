@@ -14,6 +14,7 @@ mod metrics;
 mod motd;
 mod proxy;
 mod raknet;
+mod ratelimit;
 
 #[derive(Parser)]
 #[command(version, about)]

@@ -25,6 +25,27 @@ handshake = 5
 # Backend silence timeout. No response from backend = disconnect.
 backend_silence = 10
 
+# Rate limiting / DDoS mitigation.
+# All values have sensible defaults and are optional.
+[rate_limit]
+# Max packets per second per IP (all types).
+per_ip_pps = 200
+# Max concurrent sessions per IP.
+per_ip_max_sessions = 5
+# Max new sessions per second globally.
+global_new_sessions_pps = 50
+# Max unconnected pings per second per IP (anti-amplification).
+per_ip_ping_pps = 10
+# Max packets per second per connected session.
+per_session_pps = 300
+# Min/max valid packet size in bytes (RakNet MTU max = 1492).
+min_packet_size = 1
+max_packet_size = 1492
+# Handshake failures before temporary ban.
+max_handshake_failures = 10
+# Temporary ban duration in seconds.
+ban_duration_secs = 30
+
 [backend]
 # Rate, in seconds, at which to ping servers for heatlh checks.
 health_check_rate = 5

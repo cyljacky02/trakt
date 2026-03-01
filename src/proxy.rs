@@ -12,6 +12,7 @@ use crate::load_balancer::{BackendServer, LoadBalancer};
 use crate::metrics::Metrics;
 use crate::motd::MOTDReflector;
 use crate::raknet;
+use crate::ratelimit::{RateLimitResult, RateLimiter};
 use crate::raknet::{
     datatypes::ReadBuf,
     frame::Frame,
@@ -66,6 +67,9 @@ pub struct RaknetProxy {
 
     /// Backpressure semaphore for slow-path spawns.
     slow_path_semaphore: Arc<Semaphore>,
+
+    /// Rate limiter for DDoS mitigation.
+    rate_limiter: Arc<RateLimiter>,
 }
 
 /// A client to the proxy.
@@ -173,6 +177,10 @@ impl RaknetProxy {
             LoadBalancer::init(config_provider.clone(), health_controller.clone()).await;
         let cancel_token = CancellationToken::new();
         let metrics = Arc::new(Metrics::default());
+        let rate_limiter = {
+            let config = config_provider.read().await;
+            Arc::new(RateLimiter::new(&config.rate_limit))
+        };
         Ok(Arc::new(Self {
             in_udp_sock: Arc::new(in_udp_sock),
             in_bound_port,
@@ -185,6 +193,7 @@ impl RaknetProxy {
             cancel_token,
             metrics,
             slow_path_semaphore: Arc::new(Semaphore::new(MAX_SLOW_PATH_CONCURRENT)),
+            rate_limiter,
         }))
     }
 
@@ -255,6 +264,20 @@ impl RaknetProxy {
                 }
             }
         });
+        // Rate limiter stale entry cleanup
+        tokio::spawn({
+            let rate_limiter = self.rate_limiter.clone();
+            let token = self.cancel_token.clone();
+            async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    tokio::select! {
+                        _ = token.cancelled() => return,
+                        _ = interval.tick() => rate_limiter.cleanup_stale_entries(),
+                    }
+                }
+            }
+        });
     }
 
     /// Runs the proxy server with inline fast-path and bounded slow-path.
@@ -278,8 +301,15 @@ impl RaknetProxy {
                 .packets_received
                 .fetch_add(1, Ordering::Relaxed);
 
-            // Drop non-RakNet traffic early (single byte check, zero parsing cost)
+            // Drop non-RakNet traffic early
             if !raknet::is_valid_raknet_byte(buf[0]) {
+                self.metrics.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            // Rate limit: per-IP packet rate + packet size check
+            let ip = addr.ip();
+            if self.rate_limiter.check_packet(ip, len) != RateLimitResult::Allow {
                 self.metrics.packets_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -366,6 +396,9 @@ impl RaknetProxy {
                 ),
                 _,
             ) => {
+                if self.rate_limiter.check_ping(addr.ip()) != RateLimitResult::Allow {
+                    return Ok(());
+                }
                 let mut buf = ReadBuf::new(data);
                 let _ = buf.read_u8()?;
                 self.handle_unconnected_ping(addr, buf).await?;
@@ -383,6 +416,12 @@ impl RaknetProxy {
             (Some(message_type), mut client) => {
                 log::trace!("[{}] Received offline message {:?}", addr, message_type);
                 if client.is_none() || message_type.eq(&RaknetMessage::OpenConnectionRequest1) {
+                    // Rate limit new session creation
+                    let rl = self.rate_limiter.check_new_session(addr.ip());
+                    if rl != RateLimitResult::Allow {
+                        log::debug!("[{}] New session blocked: {:?}", addr, rl);
+                        return Ok(());
+                    }
                     if let Some(client) = client {
                         let _ = client.close_tx.send(DisconnectCause::Unknown).await;
                         let _ = client.close_lock.acquire().await;
@@ -478,6 +517,7 @@ impl RaknetProxy {
             let client = client.clone();
             let clients = self.clients.clone();
             let metrics = self.metrics.clone();
+            let rate_limiter = self.rate_limiter.clone();
             async move {
                 client.server.load.fetch_add(1, Ordering::Release);
                 let loop_result = client
@@ -490,6 +530,13 @@ impl RaknetProxy {
                 };
                 let was_connected =
                     client.stage.swap(STAGE_CLOSED, Ordering::AcqRel) == STAGE_CONNECTED;
+                // Track handshake success/failure for temp-ban logic
+                if was_connected {
+                    rate_limiter.record_handshake_success(client.addr.ip());
+                } else {
+                    rate_limiter.record_handshake_failure(client.addr.ip());
+                }
+                rate_limiter.session_closed(client.addr.ip());
                 client.close_lock.add_permits(1);
                 client.server.load.fetch_sub(1, Ordering::Release);
                 metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);

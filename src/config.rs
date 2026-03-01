@@ -32,6 +32,9 @@ pub struct RootConfig {
     /// Session timeout configuration.
     #[serde(default)]
     pub timeouts: TimeoutsConfig,
+    /// Rate limiting / DDoS mitigation configuration.
+    #[serde(default)]
+    pub rate_limit: crate::ratelimit::RateLimitConfig,
     /// Backend to route players to.
     pub backend: BackendConfig,
 }
