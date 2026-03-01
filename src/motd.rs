@@ -1,6 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
-use tokio::{sync::{RwLock, Semaphore}, task::JoinSet};
+use tokio::{
+    sync::{RwLock, Semaphore},
+    task::JoinSet,
+};
 
 use crate::{
     config::ConfigProvider,

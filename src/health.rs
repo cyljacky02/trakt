@@ -1,8 +1,5 @@
 use std::{
-    sync::{
-        atomic::Ordering,
-        Arc, Weak,
-    },
+    sync::{Arc, Weak, atomic::Ordering},
     time::Duration,
 };
 

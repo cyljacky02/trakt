@@ -11,12 +11,12 @@ use crate::health::HealthController;
 use crate::load_balancer::{BackendServer, LoadBalancer};
 use crate::metrics::Metrics;
 use crate::motd::MOTDReflector;
+use crate::raknet;
 use crate::raknet::{
     datatypes::ReadBuf,
     frame::Frame,
     message::{Message, MessageUnconnectedPing, MessageUnconnectedPong, RaknetMessage},
 };
-use crate::raknet;
 use bytes::{Buf, Bytes};
 use tokio::{
     net::{ToSocketAddrs, UdpSocket},
@@ -274,7 +274,9 @@ impl RaknetProxy {
             if len == 0 {
                 continue;
             }
-            self.metrics.packets_received.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .packets_received
+                .fetch_add(1, Ordering::Relaxed);
 
             // Fast path: relay for existing connected sessions
             let fast_client = {
@@ -283,11 +285,7 @@ impl RaknetProxy {
             };
             if let Some(client) = fast_client {
                 if let Err(err) = client.udp_sock.send(&buf[..len]).await {
-                    log::debug!(
-                        "{} Unable to forward data: {:?}",
-                        client.prefix_p2s,
-                        err
-                    );
+                    log::debug!("{} Unable to forward data: {:?}", client.prefix_p2s, err);
                 }
                 // Spy for disconnect in-line (cheap)
                 if buf[0] & 0x80 != 0 {
@@ -361,9 +359,7 @@ impl RaknetProxy {
                 let _ = buf.read_u8()?;
                 self.handle_unconnected_ping(addr, buf).await?;
             }
-            (_, Some(client))
-                if client.is_connected() =>
-            {
+            (_, Some(client)) if client.is_connected() => {
                 // Connected client that wasn't caught in fast path (race) — just relay
                 if let Err(err) = client.handle_incoming_player(data).await {
                     log::debug!(
@@ -380,9 +376,7 @@ impl RaknetProxy {
                         let _ = client.close_tx.send(DisconnectCause::Unknown).await;
                         let _ = client.close_lock.acquire().await;
                     }
-                    let new_client = self
-                        .new_client(addr, STAGE_HANDSHAKE, None)
-                        .await?;
+                    let new_client = self.new_client(addr, STAGE_HANDSHAKE, None).await?;
                     client = Some(new_client);
                 }
                 client.unwrap().forward_to_server(&data).await;
@@ -477,7 +471,8 @@ impl RaknetProxy {
                     clients.remove(&client.addr);
                     clients.len()
                 };
-                let was_connected = client.stage.swap(STAGE_CLOSED, Ordering::AcqRel) == STAGE_CONNECTED;
+                let was_connected =
+                    client.stage.swap(STAGE_CLOSED, Ordering::AcqRel) == STAGE_CONNECTED;
                 client.close_lock.add_permits(1);
                 client.server.load.fetch_sub(1, Ordering::Release);
                 metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
@@ -650,11 +645,7 @@ impl RaknetClient {
     #[inline]
     async fn forward_to_player(&self, data: &[u8]) {
         if let Err(err) = self.proxy_udp_sock.send_to(data, self.addr).await {
-            log::debug!(
-                "{} Unable to forward data: {:?}",
-                self.prefix_s2p,
-                err
-            );
+            log::debug!("{} Unable to forward data: {:?}", self.prefix_s2p, err);
         }
     }
 
@@ -746,11 +737,7 @@ impl RaknetClient {
     #[inline]
     async fn forward_to_server(&self, data: &[u8]) {
         if let Err(err) = self.udp_sock.send(data).await {
-            log::debug!(
-                "{} Unable to forward data: {:?}",
-                self.prefix_p2s,
-                err
-            );
+            log::debug!("{} Unable to forward data: {:?}", self.prefix_p2s, err);
         }
     }
 }

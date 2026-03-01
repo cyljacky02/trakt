@@ -1,6 +1,6 @@
 use crate::raknet::datatypes::{ReadBuf, WriteBuf};
 
-use super::{write_header, Message, MessageError, RaknetMessage};
+use super::{Message, MessageError, RaknetMessage, write_header};
 
 #[derive(Clone, Debug)]
 pub struct MessageUnconnectedPing {
