@@ -278,31 +278,42 @@ impl RaknetProxy {
                 .packets_received
                 .fetch_add(1, Ordering::Relaxed);
 
+            // Drop non-RakNet traffic early (single byte check, zero parsing cost)
+            if !raknet::is_valid_raknet_byte(buf[0]) {
+                self.metrics.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
             // Fast path: relay for existing connected sessions
             let fast_client = {
                 let clients = self.clients.read().unwrap();
                 clients.get(&addr).filter(|c| c.is_connected()).cloned()
             };
             if let Some(client) = fast_client {
-                if let Err(err) = client.udp_sock.send(&buf[..len]).await {
-                    log::debug!("{} Unable to forward data: {:?}", client.prefix_p2s, err);
-                }
-                // Spy for disconnect in-line (cheap)
-                if buf[0] & 0x80 != 0 {
-                    let data = Bytes::copy_from_slice(&buf[..len]);
-                    if matches!(
-                        client.spy_datagram(Direction::PlayerToServer, data),
-                        Ok(SpyDatagramResult::Disconnect)
-                    ) {
-                        log::debug!(
-                            "{} Found disconnect notification in datagram",
-                            client.prefix_p2s,
-                        );
-                        let _ = client.close_tx.send(DisconnectCause::Client).await;
+                if !raknet::is_connected_traffic(buf[0]) {
+                    // Connected client sent an offline-type packet (e.g. new handshake);
+                    // fall through to slow path for re-connection handling
+                } else {
+                    if let Err(err) = client.udp_sock.send(&buf[..len]).await {
+                        log::debug!("{} Unable to forward data: {:?}", client.prefix_p2s, err);
                     }
+                    // Spy for disconnect in datagrams
+                    if raknet::is_datagram(buf[0]) {
+                        let data = Bytes::copy_from_slice(&buf[..len]);
+                        if matches!(
+                            client.spy_datagram(Direction::PlayerToServer, data),
+                            Ok(SpyDatagramResult::Disconnect)
+                        ) {
+                            log::debug!(
+                                "{} Found disconnect notification in datagram",
+                                client.prefix_p2s,
+                            );
+                            let _ = client.close_tx.send(DisconnectCause::Client).await;
+                        }
+                    }
+                    self.metrics.packets_relayed.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
-                self.metrics.packets_relayed.fetch_add(1, Ordering::Relaxed);
-                continue;
             }
 
             // Slow path: new session, offline message, or handshake — bounded spawn
