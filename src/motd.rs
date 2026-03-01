@@ -54,7 +54,10 @@ impl MOTDReflector {
             let proxy_protocol = config.proxy_protocol.unwrap_or(true);
             (config.proxy_bind.clone(), sources, proxy_protocol)
         };
-        tracing::debug!(source_count = sources.len(), "Fetching MOTD information from backend");
+        tracing::debug!(
+            source_count = sources.len(),
+            "Fetching MOTD information from backend"
+        );
         let timeout = Duration::from_secs(5);
         let mut join_set = JoinSet::new();
         for source in sources.into_iter() {

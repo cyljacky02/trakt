@@ -13,12 +13,12 @@ use crate::load_balancer::{BackendServer, LoadBalancer};
 use crate::metrics::Metrics;
 use crate::motd::MOTDReflector;
 use crate::raknet;
-use crate::ratelimit::{RateLimitResult, RateLimiter};
 use crate::raknet::{
     datatypes::ReadBuf,
     frame::Frame,
     message::{Message, MessageUnconnectedPing, MessageUnconnectedPong, RaknetMessage},
 };
+use crate::ratelimit::{RateLimitResult, RateLimiter};
 use bytes::{Buf, Bytes};
 use tokio::{
     net::{ToSocketAddrs, UdpSocket},
@@ -692,7 +692,11 @@ impl RaknetClient {
             return Ok(());
         }
         if data[0] & 0x80 == 0 {
-            tracing::trace!(header = format_args!("{:02x}", data[0]), direction = "p2s", "Received non-datagram data");
+            tracing::trace!(
+                header = format_args!("{:02x}", data[0]),
+                direction = "p2s",
+                "Received non-datagram data"
+            );
             // while this is technically invalid,
             // not forwarding it would make the proxy inconsistent
             self.forward_to_server(&data).await;
@@ -703,7 +707,10 @@ impl RaknetClient {
             self.spy_datagram(Direction::PlayerToServer, data),
             Ok(SpyDatagramResult::Disconnect)
         ) {
-            tracing::debug!(direction = "p2s", "Found disconnect notification in datagram");
+            tracing::debug!(
+                direction = "p2s",
+                "Found disconnect notification in datagram"
+            );
             self.close_tx.send(DisconnectCause::Client).await?
         }
         Ok(())

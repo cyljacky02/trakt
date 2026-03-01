@@ -3,7 +3,9 @@ use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota, RateLimiter as GovRateLimiter};
+use governor::{
+    DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota, RateLimiter as GovRateLimiter,
+};
 use serde::{Deserialize, Serialize};
 
 /// Per-IP domain-specific state (session tracking and bans).
@@ -94,15 +96,11 @@ pub enum RateLimitResult {
 impl RateLimiter {
     pub fn new(config: &RateLimitConfig) -> Self {
         Self {
-            packet_limiter: GovRateLimiter::keyed(
-                Quota::per_second(nonzero(config.per_ip_pps)),
-            ),
-            ping_limiter: GovRateLimiter::keyed(
-                Quota::per_second(nonzero(config.per_ip_ping_pps)),
-            ),
-            global_session_limiter: GovRateLimiter::direct(
-                Quota::per_second(nonzero(config.global_new_sessions_pps)),
-            ),
+            packet_limiter: GovRateLimiter::keyed(Quota::per_second(nonzero(config.per_ip_pps))),
+            ping_limiter: GovRateLimiter::keyed(Quota::per_second(nonzero(config.per_ip_ping_pps))),
+            global_session_limiter: GovRateLimiter::direct(Quota::per_second(nonzero(
+                config.global_new_sessions_pps,
+            ))),
             ip_state: DashMap::new(),
             session_limit: config.per_ip_max_sessions,
             max_handshake_failures: config.max_handshake_failures,
@@ -222,8 +220,7 @@ impl RateLimiter {
 
         // Clean up our own IP state — keep only entries with active sessions or unexpired bans
         self.ip_state.retain(|_, state| {
-            state.session_count > 0
-                || state.banned_until.is_some_and(|t| Instant::now() < t)
+            state.session_count > 0 || state.banned_until.is_some_and(|t| Instant::now() < t)
         });
     }
 }

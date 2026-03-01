@@ -3,9 +3,9 @@ use std::{path::PathBuf, process::exit, str::FromStr, sync::Arc};
 use clap::Parser;
 use config::ConfigProvider;
 use proxy::RaknetProxy;
-use tracing_subscriber::{EnvFilter, fmt};
-use tracing_subscriber::prelude::*;
 use tokio::io::AsyncBufReadExt;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{EnvFilter, fmt};
 
 mod config;
 mod health;
@@ -45,13 +45,11 @@ fn main() {
         1 => "debug",
         _ => "trace",
     };
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_level));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer()
-            .with_target(true)
-            .with_ansi(!args.no_color))
+        .with(fmt::layer().with_target(true).with_ansi(!args.no_color))
         .init();
 
     if args.raise_ulimit {
