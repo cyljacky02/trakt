@@ -62,8 +62,7 @@ fn main() {
 
     let config_file = args
         .config
-        .as_ref()
-        .map(PathBuf::clone)
+        .clone()
         .unwrap_or_else(|| PathBuf::from_str("config.toml").unwrap());
     let config_provider = match config::read_config(config_file.clone()) {
         Ok(config) => config,

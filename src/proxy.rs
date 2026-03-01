@@ -395,7 +395,7 @@ impl RaknetProxy {
     /// * `addr` - Remote player client address
     /// * `stage` - Connection stage constant (`STAGE_HANDSHAKE` for new ones)
     /// * `server` - Specific backend server. If [`None`], one will be picked
-    ///              from the load balancer.
+    ///   from the load balancer.
     async fn new_client(
         &self,
         addr: SocketAddr,
@@ -611,13 +611,22 @@ impl RaknetClient {
                     self.forward_to_player(&buf[..len]).await;
 
                     let message_type = RaknetMessage::from_u8(buf[0]);
-                    if matches!(message_type, Some(RaknetMessage::OpenConnectionReply2)) {
-                        if self.stage.compare_exchange(
-                            STAGE_HANDSHAKE, STAGE_CONNECTED,
-                            Ordering::AcqRel, Ordering::Acquire
-                        ).is_ok() {
-                            log::info!("Player {} has connected to {}", self.addr, self.server.addr)
-                        }
+                    if matches!(message_type, Some(RaknetMessage::OpenConnectionReply2))
+                        && self
+                            .stage
+                            .compare_exchange(
+                                STAGE_HANDSHAKE,
+                                STAGE_CONNECTED,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                    {
+                        log::info!(
+                            "Player {} has connected to {}",
+                            self.addr,
+                            self.server.addr
+                        )
                     }
                     if let Some(ref mt) = message_type {
                         log::trace!(
