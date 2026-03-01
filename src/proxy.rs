@@ -582,8 +582,7 @@ impl RaknetProxy {
                 // server still appears in the client's server list.
                 format!(
                     "MCPE;{};{};{};0;0;{};{};Survival;1;{};{};",
-                    "Connecting...", 0, "", server_uuid, "",
-                    self.in_bound_port, self.in_bound_port
+                    "Connecting...", 0, "", server_uuid, "", self.in_bound_port, self.in_bound_port
                 )
             }
         };
