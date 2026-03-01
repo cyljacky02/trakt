@@ -1,34 +1,40 @@
 use rand::Rng;
-use std::collections::hash_map::Entry;
-use std::path::PathBuf;
-use std::str::FromStr;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime};
+use std::fmt;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::ConfigProvider;
 use crate::health::HealthController;
 use crate::load_balancer::{BackendServer, LoadBalancer};
+use crate::metrics::Metrics;
 use crate::motd::MOTDReflector;
 use crate::raknet::{
     datatypes::ReadBuf,
     frame::Frame,
     message::{Message, MessageUnconnectedPing, MessageUnconnectedPong, RaknetMessage},
 };
-use crate::scheduler::Scheduler;
-use crate::snapshot::{RaknetClientSnapshot, RaknetProxySnapshot};
-use crate::{raknet, snapshot};
+use crate::raknet;
 use bytes::{Buf, Bytes};
 use tokio::{
     net::{ToSocketAddrs, UdpSocket},
-    sync::{RwLock, Semaphore},
+    sync::Semaphore,
 };
 
 use ppp::v2 as haproxy;
 
-/// Raknet proxy server that manage connections and use
-/// the load balancers to the server for new connections.
+/// Maximum concurrent slow-path (new session / offline message) handlers.
+const MAX_SLOW_PATH_CONCURRENT: usize = 256;
+
+/// Connection stage constants.
+const STAGE_HANDSHAKE: u8 = 0;
+const STAGE_CONNECTED: u8 = 1;
+const STAGE_CLOSED: u8 = 2;
+
+/// Raknet proxy server that manages connections and uses
+/// the load balancer to pick the server for new connections.
 ///
 /// It will forward all the traffic, except offline (no initialized Raknet connection
 /// with the server) MOTD requests.
@@ -42,7 +48,7 @@ pub struct RaknetProxy {
     /// representing the server.
     server_uuid: i64,
     /// All current clients of the proxy.
-    clients: Arc<RwLock<HashMap<SocketAddr, Arc<RaknetClient>>>>,
+    clients: Arc<std::sync::RwLock<HashMap<SocketAddr, Arc<RaknetClient>>>>,
 
     /// Config provider.
     config_provider: Arc<ConfigProvider>,
@@ -52,11 +58,14 @@ pub struct RaknetProxy {
     load_balancer: LoadBalancer,
     /// Health controller.
     health_controller: Arc<HealthController>,
-    /// Scheduler.
-    scheduler: Scheduler,
+    /// Cancellation token for stopping background tasks.
+    cancel_token: CancellationToken,
 
-    /// Recovery snapshot file.
-    recovery_snapshot_file: PathBuf,
+    /// Metrics counters.
+    metrics: Arc<Metrics>,
+
+    /// Backpressure semaphore for slow-path spawns.
+    slow_path_semaphore: Arc<Semaphore>,
 }
 
 /// A client to the proxy.
@@ -70,27 +79,22 @@ struct RaknetClient {
     server: Arc<BackendServer>,
     /// UDP socket for Player <-> Proxy traffic.
     proxy_udp_sock: Arc<UdpSocket>,
-    /// UDP socket for Proxy <-> Server traffic.
+    /// UDP socket for Proxy <-> Server traffic (connected to backend).
     udp_sock: UdpSocket,
     /// Cached local socket address of `udp_sock`.
     udp_sock_addr: SocketAddr,
     /// Connection stage.
-    stage: RwLock<ConnectionStage>,
+    stage: AtomicU8,
 
     /// Close notifier.
     close_tx: mpsc::Sender<DisconnectCause>,
     /// Semaphore used to wait for guaranteed close state.
     close_lock: Semaphore,
-}
 
-/// The stage at which a connection is at.
-enum ConnectionStage {
-    /// Processing Raknet handshake packets (open connection 1 & 2).
-    Handshake,
-    /// Past Raknet handshake packets. May still be in Game handshake.
-    Connected,
-    /// The connection is closed.
-    Closed,
+    /// Cached debug prefix string (player→server direction).
+    prefix_p2s: String,
+    /// Cached debug prefix string (server→player direction).
+    prefix_s2p: String,
 }
 
 /// Result of spying into a datagram packet.
@@ -110,6 +114,19 @@ enum Direction {
     ServerToPlayer,
 }
 
+impl RaknetClient {
+    #[inline]
+    fn stage(&self) -> u8 {
+        self.stage.load(Ordering::Acquire)
+    }
+
+    /// Returns true if the client is in the Connected stage.
+    #[inline]
+    fn is_connected(&self) -> bool {
+        self.stage() == STAGE_CONNECTED
+    }
+}
+
 /// Why a player disconnected from a server.
 #[derive(Debug, Clone, Copy)]
 enum DisconnectCause {
@@ -125,7 +142,7 @@ enum DisconnectCause {
     Unknown,
 }
 
-/// Overview of the load of a [`RaknetProy`].
+/// Overview of the load of a [`RaknetProxy`].
 #[derive(Debug, Clone)]
 pub struct LoadOverview {
     /// Number of active clients.
@@ -143,11 +160,9 @@ impl RaknetProxy {
     ///
     /// * `in_addr` - Address to bind to for Player <-> Proxy traffic
     /// * `config_provider` - Config provider
-    /// * `recovery_snapshot_file` - Recovery snapshot file
     pub async fn bind<A: ToSocketAddrs>(
         in_addr: A,
         config_provider: Arc<ConfigProvider>,
-        recovery_snapshot_file: PathBuf,
     ) -> std::io::Result<Arc<Self>> {
         let in_udp_sock = UdpSocket::bind(in_addr).await?;
         let in_bound_port = in_udp_sock.local_addr()?.port();
@@ -156,107 +171,32 @@ impl RaknetProxy {
         let health_controller = Arc::new(HealthController::new(config_provider.clone()));
         let load_balancer =
             LoadBalancer::init(config_provider.clone(), health_controller.clone()).await;
-        let scheduler = Scheduler::new(
-            config_provider.clone(),
-            motd_reflector.clone(),
-            health_controller.clone(),
-        );
+        let cancel_token = CancellationToken::new();
+        let metrics = Arc::new(Metrics::default());
         Ok(Arc::new(Self {
             in_udp_sock: Arc::new(in_udp_sock),
             in_bound_port,
             server_uuid,
             config_provider,
-            clients: Default::default(),
+            clients: Arc::new(std::sync::RwLock::new(HashMap::new())),
             motd_reflector,
             load_balancer,
             health_controller,
-            scheduler,
-            recovery_snapshot_file,
+            cancel_token,
+            metrics,
+            slow_path_semaphore: Arc::new(Semaphore::new(MAX_SLOW_PATH_CONCURRENT)),
         }))
     }
 
-    /// Recovers active connections from a recovery snapshot.
-    ///
-    /// ## Arguments
-    ///
-    /// * `snapshot` - Recovery snapshot
-    pub async fn recover_from_snapshot(&self, snapshot: RaknetProxySnapshot) {
-        let mut servers: HashMap<SocketAddr, Arc<BackendServer>> = HashMap::new();
-        for client in snapshot.clients {
-            let addr = match SocketAddr::from_str(&client.addr) {
-                Ok(addr) => addr,
-                Err(err) => {
-                    log::warn!(
-                        "Could not recover client {} from snapshot: Invalid address: {:?}",
-                        client.addr,
-                        err
-                    );
-                    continue;
-                }
-            };
-            let server_addr = match SocketAddr::from_str(&client.server_addr) {
-                Ok(addr) => addr,
-                Err(err) => {
-                    log::warn!(
-                        "Could not recover client {} from snapshot: Invalid server address: {:?}",
-                        client.addr,
-                        err
-                    );
-                    continue;
-                }
-            };
-            let server = match servers.entry(server_addr) {
-                Entry::Occupied(entry) => entry.get().clone(),
-                Entry::Vacant(entry) => {
-                    let server = match self.load_balancer.get_server(server_addr).await {
-                        Some(server) => {
-                            log::debug!("Recovering server {} on active instance", server_addr);
-                            server
-                        }
-                        None => {
-                            log::debug!("Recovering server {} on stale instance", server_addr);
-                            Arc::new(BackendServer::new(server_addr))
-                        }
-                    };
-                    entry.insert(server).clone()
-                }
-            };
-            if let Err(err) = self
-                .new_client(
-                    addr,
-                    ConnectionStage::Connected,
-                    Some(client.proxy_server_bind),
-                    Some(server),
-                )
-                .await
-            {
-                log::warn!(
-                    "Could not recover client {} from snapshot: {:?}",
-                    client.addr,
-                    err
-                );
-            } else {
-                log::info!(
-                    "Recover player {}. Connected to {}",
-                    client.addr,
-                    server_addr
-                )
-            }
-        }
-        for (_, server) in servers {
-            self.health_controller.register_server(server).await;
-        }
-    }
-
-    /// Reloads configuration.
+    /// Reloads configuration and restarts background tasks.
     pub async fn reload_config(&self) {
         self.load_balancer.reload_config().await;
-        self.scheduler.restart().await;
+        // Background tasks re-read config on next tick automatically
     }
 
     /// Obtains a load overview.
-    pub async fn load_overview(&self) -> LoadOverview {
-        let clients = self.clients.read().await;
+    pub fn load_overview(&self) -> LoadOverview {
+        let clients = self.clients.read().unwrap();
         let mut per_server = HashMap::new();
         let mut client_count = 0;
         let mut connected_count = 0;
@@ -264,8 +204,7 @@ impl RaknetProxy {
             let server_load = per_server.entry(client.server.addr).or_default();
             *server_load += 1;
             client_count += 1;
-            let stage = client.stage.read().await;
-            if matches!(*stage, ConnectionStage::Connected) {
+            if client.is_connected() {
                 connected_count += 1;
             }
         }
@@ -276,12 +215,54 @@ impl RaknetProxy {
         }
     }
 
-    /// Runs the proxy server.
+    /// Starts background tasks (health checks + MOTD refresh).
+    pub fn start_background_tasks(self: &Arc<Self>) {
+        // Health check loop
+        tokio::spawn({
+            let config_provider = self.config_provider.clone();
+            let health_controller = self.health_controller.clone();
+            let token = self.cancel_token.clone();
+            async move {
+                let rate = {
+                    let config = config_provider.read().await;
+                    Duration::from_secs(u64::max(config.backend.health_check_rate, 1))
+                };
+                let mut interval = tokio::time::interval(rate);
+                loop {
+                    tokio::select! {
+                        _ = token.cancelled() => return,
+                        _ = interval.tick() => health_controller.execute().await,
+                    }
+                }
+            }
+        });
+        // MOTD refresh loop
+        tokio::spawn({
+            let config_provider = self.config_provider.clone();
+            let motd_reflector = self.motd_reflector.clone();
+            let token = self.cancel_token.clone();
+            async move {
+                let rate = {
+                    let config = config_provider.read().await;
+                    Duration::from_secs(u64::max(config.backend.motd_refresh_rate, 1))
+                };
+                let mut interval = tokio::time::interval(rate);
+                loop {
+                    tokio::select! {
+                        _ = token.cancelled() => return,
+                        _ = interval.tick() => motd_reflector.execute().await,
+                    }
+                }
+            }
+        });
+    }
+
+    /// Runs the proxy server with inline fast-path and bounded slow-path.
     ///
-    /// If stopped graciously it will return `Ok(())`, otherwise it will return an error.
+    /// If stopped gracefully it will return `Ok(())`, otherwise it will return an error.
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
-        self.scheduler.start();
-        log::debug!(
+        self.start_background_tasks();
+        log::info!(
             "Starting Raknet proxy server on {}",
             self.in_udp_sock.local_addr()?
         );
@@ -290,18 +271,63 @@ impl RaknetProxy {
         let mut buf = [0u8; 1492];
         loop {
             let (len, addr) = udp_sock.recv_from(&mut buf).await?;
-            let data = Bytes::copy_from_slice(&buf[..len]);
+            if len == 0 {
+                continue;
+            }
+            self.metrics.packets_received.fetch_add(1, Ordering::Relaxed);
 
+            // Fast path: relay for existing connected sessions
+            let fast_client = {
+                let clients = self.clients.read().unwrap();
+                clients.get(&addr).filter(|c| c.is_connected()).cloned()
+            };
+            if let Some(client) = fast_client {
+                if let Err(err) = client.udp_sock.send(&buf[..len]).await {
+                    log::debug!(
+                        "{} Unable to forward data: {:?}",
+                        client.prefix_p2s,
+                        err
+                    );
+                }
+                // Spy for disconnect in-line (cheap)
+                if buf[0] & 0x80 != 0 {
+                    let data = Bytes::copy_from_slice(&buf[..len]);
+                    if matches!(
+                        client.spy_datagram(Direction::PlayerToServer, data),
+                        Ok(SpyDatagramResult::Disconnect)
+                    ) {
+                        log::debug!(
+                            "{} Found disconnect notification in datagram",
+                            client.prefix_p2s,
+                        );
+                        let _ = client.close_tx.send(DisconnectCause::Client).await;
+                    }
+                }
+                self.metrics.packets_relayed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            // Slow path: new session, offline message, or handshake — bounded spawn
+            let data = Bytes::copy_from_slice(&buf[..len]);
+            let permit = match self.slow_path_semaphore.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    log::warn!("[{}] Slow-path backpressure: dropping packet", addr);
+                    self.metrics.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
             tokio::spawn({
-                let __self = self.clone();
+                let proxy = self.clone();
                 async move {
-                    if let Err(err) = __self.handle_recv(addr, data).await {
+                    if let Err(err) = proxy.handle_recv_slow(addr, data).await {
                         log::debug!(
                             "[{}] Unable to handle player -> server UDP datagram message: {:?}",
                             addr,
                             err
                         );
                     }
+                    drop(permit);
                 }
             });
         }
@@ -309,69 +335,19 @@ impl RaknetProxy {
 
     /// Performs a cleanup after the proxy stopped.
     pub async fn cleanup(&self) {
-        self.scheduler.stop(true).await;
+        self.cancel_token.cancel();
     }
 
-    /// Takes a snapshot of the current proxy state.
-    pub async fn take_snapshot(&self) -> anyhow::Result<RaknetProxySnapshot> {
-        let config = {
-            let config = self.config_provider.read().await;
-            config.clone()
-        };
-        let player_proxy_bind = self.in_udp_sock.local_addr()?.to_string();
-        let active_clients = self.clients.read().await;
-        let mut clients = Vec::new();
-        for (_, client) in active_clients.iter() {
-            let stage = client.stage.read().await;
-            if !matches!(*stage, ConnectionStage::Connected) {
-                continue;
-            }
-            clients.push(RaknetClientSnapshot {
-                addr: client.addr.to_string(),
-                server_addr: client.server.addr.to_string(),
-                proxy_server_bind: client.udp_sock.local_addr()?.to_string(),
-            });
-        }
-        let taken_at = SystemTime::now();
-        Ok(RaknetProxySnapshot {
-            taken_at,
-            config,
-            player_proxy_bind,
-            clients,
-        })
-    }
-
-    /// Takes a snapshot of the current proxy state and try to write it to disk.
-    pub async fn take_and_write_snapshot(&self) -> bool {
-        let snapshot = match self.take_snapshot().await {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                log::error!("Could not take proxy state snapshot: {:?}", err);
-                return false;
-            }
-        };
-        match snapshot::write_snapshot_file(&self.recovery_snapshot_file, &snapshot) {
-            Ok(_) => true,
-            Err(err) => {
-                log::error!("Could not write proxy state snapshot to disk: {:?}", err);
-                false
-            }
-        }
-    }
-
-    /// Handles incoming data from the UDP socket from the player to the server.
+    /// Slow-path handler for packets that need session creation or offline processing.
     ///
     /// ## Arguments
     ///
     /// * `addr` - Remote player client address
     /// * `data` - Raw received data
-    async fn handle_recv(&self, addr: SocketAddr, data: Bytes) -> anyhow::Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
+    async fn handle_recv_slow(&self, addr: SocketAddr, data: Bytes) -> anyhow::Result<()> {
         let message_type = RaknetMessage::from_u8(data[0]);
         let client = {
-            let clients = self.clients.read().await;
+            let clients = self.clients.read().unwrap();
             clients.get(&addr).cloned()
         };
         match (message_type, client) {
@@ -386,12 +362,13 @@ impl RaknetProxy {
                 self.handle_unconnected_ping(addr, buf).await?;
             }
             (_, Some(client))
-                if matches!(*client.stage.read().await, ConnectionStage::Connected) =>
+                if client.is_connected() =>
             {
+                // Connected client that wasn't caught in fast path (race) — just relay
                 if let Err(err) = client.handle_incoming_player(data).await {
                     log::debug!(
                         "{} Unable to handle UDP datagram message: {:?}",
-                        client.debug_prefix(Direction::PlayerToServer),
+                        client.prefix_p2s,
                         err
                     );
                 }
@@ -404,7 +381,7 @@ impl RaknetProxy {
                         let _ = client.close_lock.acquire().await;
                     }
                     let new_client = self
-                        .new_client(addr, ConnectionStage::Handshake, None, None)
+                        .new_client(addr, STAGE_HANDSHAKE, None)
                         .await?;
                     client = Some(new_client);
                 }
@@ -415,40 +392,32 @@ impl RaknetProxy {
         Ok(())
     }
 
-    /// Creates and insert a new client.
+    /// Creates and inserts a new client.
     /// The caller is responsible for ensuring it would not overwrite an existing client,
     /// otherwise an error will be returned and the client won't be created.
     ///
     /// ## Arguments
     ///
     /// * `addr` - Remote player client address
-    /// * `stage` - Connection stage. Should be [`ConnectionStage::Handshake`] for new ones
-    /// * `proxy_bind` - Specific Proxy <-> Server bind socket address. If [`None`], the
-    ///                  default one will be used
+    /// * `stage` - Connection stage constant (`STAGE_HANDSHAKE` for new ones)
     /// * `server` - Specific backend server. If [`None`], one will be picked
     ///              from the load balancer.
     async fn new_client(
         &self,
         addr: SocketAddr,
-        stage: ConnectionStage,
-        proxy_bind: Option<String>,
+        stage: u8,
         server: Option<Arc<BackendServer>>,
     ) -> anyhow::Result<Arc<RaknetClient>> {
-        let (proxy_bind, proxy_protocol) = {
+        let (proxy_bind, proxy_protocol, handshake_timeout, backend_silence_timeout) = {
             let config = self.config_provider.read().await;
             (
-                proxy_bind.unwrap_or(config.proxy_bind.clone()),
+                config.proxy_bind.clone(),
                 config.proxy_protocol.unwrap_or(true),
+                Duration::from_secs(config.timeouts.handshake),
+                Duration::from_secs(config.timeouts.backend_silence),
             )
         };
-        let sock = UdpSocket::bind(proxy_bind).await?;
-        let mut clients = self.clients.write().await;
-        if clients.contains_key(&addr) {
-            return Err(anyhow::anyhow!(
-                "Failed to maintain state for client {}",
-                addr
-            ));
-        }
+
         let server = match server {
             Some(server) => server,
             None => match self.load_balancer.next().await {
@@ -459,37 +428,59 @@ impl RaknetProxy {
                 None => return Err(anyhow::anyhow!("No server available to proxy this player")),
             },
         };
+
+        let sock = UdpSocket::bind(&proxy_bind).await?;
+        sock.connect(server.addr).await?;
+        let udp_sock_addr = sock.local_addr()?;
+
+        let mut clients = self.clients.write().unwrap();
+        if clients.contains_key(&addr) {
+            return Err(anyhow::anyhow!(
+                "Failed to maintain state for client {}",
+                addr
+            ));
+        }
         let (tx, rx) = mpsc::channel(1);
+        let prefix_p2s = format!(
+            "[player: {} -> server {} ({})]",
+            addr, server.addr, udp_sock_addr
+        );
+        let prefix_s2p = format!(
+            "[server: {} ({}) -> player {}]",
+            server.addr, udp_sock_addr, addr
+        );
         let client = Arc::new(RaknetClient {
             addr,
             server,
             proxy_udp_sock: self.in_udp_sock.clone(),
-            udp_sock_addr: sock.local_addr()?,
+            udp_sock_addr,
             udp_sock: sock,
-            stage: RwLock::new(stage),
+            stage: AtomicU8::new(stage),
             close_tx: tx,
             close_lock: Semaphore::new(0),
+            prefix_p2s,
+            prefix_s2p,
         });
         clients.insert(addr, client.clone());
+        self.metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
         tokio::spawn({
             let client = client.clone();
             let clients = self.clients.clone();
+            let metrics = self.metrics.clone();
             async move {
-                client.server.load.fetch_add(1, Ordering::Relaxed);
-                let loop_result = client.run_event_loop(rx).await;
+                client.server.load.fetch_add(1, Ordering::Release);
+                let loop_result = client
+                    .run_event_loop(rx, handshake_timeout, backend_silence_timeout)
+                    .await;
                 let client_count = {
-                    let mut clients = clients.write().await;
+                    let mut clients = clients.write().unwrap();
                     clients.remove(&client.addr);
                     clients.len()
                 };
-                let was_connected = {
-                    let mut w = client.stage.write().await;
-                    let was_connected = matches!(*w, ConnectionStage::Connected);
-                    *w = ConnectionStage::Closed;
-                    was_connected
-                };
+                let was_connected = client.stage.swap(STAGE_CLOSED, Ordering::AcqRel) == STAGE_CONNECTED;
                 client.close_lock.add_permits(1);
-                client.server.load.fetch_sub(1, Ordering::Relaxed);
+                client.server.load.fetch_sub(1, Ordering::Release);
+                metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                 let cause = match loop_result {
                     Ok(cause) => {
                         log::debug!(
@@ -509,12 +500,15 @@ impl RaknetProxy {
                         DisconnectCause::Error
                     }
                 };
+                if matches!(cause, DisconnectCause::Timeout) {
+                    metrics.timeout_disconnects.fetch_add(1, Ordering::Relaxed);
+                }
                 if was_connected {
                     log::info!(
                         "Player {} has disconnected from {} ({})",
                         client.addr,
                         client.server.addr,
-                        cause.to_str(),
+                        cause,
                     )
                 }
             }
@@ -523,7 +517,7 @@ impl RaknetProxy {
             "Client initialized: {} <-> {} ({}) | {} total",
             client.addr,
             client.server.addr,
-            client.udp_sock.local_addr()?,
+            client.udp_sock_addr,
             clients.len()
         );
         if proxy_protocol {
@@ -568,6 +562,11 @@ impl RaknetProxy {
         self.in_udp_sock.send_to(&pong.to_bytes()?, addr).await?;
         Ok(())
     }
+
+    /// Returns a reference to the metrics counters.
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
 }
 
 impl RaknetClient {
@@ -579,19 +578,24 @@ impl RaknetClient {
             (self.addr, self.proxy_udp_sock.local_addr()?),
         )
         .build()?;
-        self.udp_sock.send_to(&header, self.server.addr).await?;
+        self.udp_sock.send(&header).await?;
         Ok(())
     }
 
-    /// Runs the client event loop.
+    /// Runs the client event loop with phase-specific timeouts.
     async fn run_event_loop(
         &self,
         mut rx: mpsc::Receiver<DisconnectCause>,
+        handshake_timeout: Duration,
+        backend_silence_timeout: Duration,
     ) -> anyhow::Result<DisconnectCause> {
         let mut buf = [0u8; 1492];
-        // 10 seconds without data from the server = force close
-        let timeout = Duration::from_secs(10);
         loop {
+            let timeout = match self.stage() {
+                STAGE_HANDSHAKE => handshake_timeout,
+                STAGE_CONNECTED => backend_silence_timeout,
+                _ => return Ok(DisconnectCause::Unknown),
+            };
             tokio::select! {
                 cause = rx.recv() => return Ok(cause.unwrap_or(DisconnectCause::Unknown)),
 
@@ -600,55 +604,42 @@ impl RaknetClient {
                         Ok(res) => res?,
                         Err(_) => return Ok(DisconnectCause::Timeout),
                     };
-                    let data = Bytes::copy_from_slice(&buf[..len]);
-                    if let Err(err) = self.handle_incoming_server(data).await {
-                        log::debug!(
-                            "{} Unable to handle UDP datagram message: {:?}",
-                            self.debug_prefix(Direction::ServerToPlayer),
-                            err
+                    if len == 0 {
+                        continue;
+                    }
+                    self.forward_to_player(&buf[..len]).await;
+
+                    let message_type = RaknetMessage::from_u8(buf[0]);
+                    if matches!(message_type, Some(RaknetMessage::OpenConnectionReply2)) {
+                        if self.stage.compare_exchange(
+                            STAGE_HANDSHAKE, STAGE_CONNECTED,
+                            Ordering::AcqRel, Ordering::Acquire
+                        ).is_ok() {
+                            log::info!("Player {} has connected to {}", self.addr, self.server.addr)
+                        }
+                    }
+                    if let Some(ref mt) = message_type {
+                        log::trace!(
+                            "{} Relaying message {:?}",
+                            self.prefix_s2p,
+                            mt
                         );
+                    }
+                    // Spy for disconnect
+                    let data = Bytes::copy_from_slice(&buf[..len]);
+                    if matches!(
+                        self.spy_datagram(Direction::ServerToPlayer, data),
+                        Ok(SpyDatagramResult::Disconnect)
+                    ) {
+                        log::debug!(
+                            "{} Found disconnect notification in datagram",
+                            self.prefix_s2p,
+                        );
+                        self.close_tx.send(DisconnectCause::Server).await?;
                     }
                 }
             }
         }
-    }
-
-    /// Handles incoming data from the UDP socket from the server to the player.
-    ///
-    /// ## Arguments
-    ///
-    /// * `data` - Raw received data
-    async fn handle_incoming_server(&self, data: Bytes) -> anyhow::Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        let message_type = RaknetMessage::from_u8(data[0]);
-        if matches!(message_type, Some(RaknetMessage::OpenConnectionReply2)) {
-            let mut w = self.stage.write().await;
-            if !matches!(*w, ConnectionStage::Connected) {
-                *w = ConnectionStage::Connected;
-                log::info!("Player {} has connected to {}", self.addr, self.server.addr)
-            }
-        }
-        if let Some(message_type) = message_type {
-            log::trace!(
-                "{} Relaying message {:?}",
-                self.debug_prefix(Direction::ServerToPlayer),
-                message_type
-            );
-        }
-        self.forward_to_player(&data).await;
-        if matches!(
-            self.spy_datagram(Direction::ServerToPlayer, data),
-            Ok(SpyDatagramResult::Disconnect)
-        ) {
-            log::debug!(
-                "{} Found disconnect notification in datagram",
-                self.debug_prefix(Direction::ServerToPlayer),
-            );
-            self.close_tx.send(DisconnectCause::Server).await?;
-        }
-        Ok(())
     }
 
     /// Forwards data received from the server to the player.
@@ -661,7 +652,7 @@ impl RaknetClient {
         if let Err(err) = self.proxy_udp_sock.send_to(data, self.addr).await {
             log::debug!(
                 "{} Unable to forward data: {:?}",
-                self.debug_prefix(Direction::ServerToPlayer),
+                self.prefix_s2p,
                 err
             );
         }
@@ -679,7 +670,7 @@ impl RaknetClient {
         if data[0] & 0x80 == 0 {
             log::trace!(
                 "{} Received non-datagram data, with header {:02x}",
-                self.debug_prefix(Direction::PlayerToServer),
+                self.prefix_p2s,
                 data[0]
             );
             // while this is technically invalid,
@@ -694,7 +685,7 @@ impl RaknetClient {
         ) {
             log::debug!(
                 "{} Found disconnect notification in datagram",
-                self.debug_prefix(Direction::PlayerToServer),
+                self.prefix_p2s,
             );
             self.close_tx.send(DisconnectCause::Client).await?;
         }
@@ -729,9 +720,13 @@ impl RaknetClient {
                 continue;
             }
             let message_type = RaknetMessage::from_u8(frame.body[0]);
+            let prefix = match direction {
+                Direction::PlayerToServer => &self.prefix_p2s,
+                Direction::ServerToPlayer => &self.prefix_s2p,
+            };
             log::trace!(
                 "{} Frame with message type {:?} ({:02x}) and body size {}",
-                self.debug_prefix(direction),
+                prefix,
                 message_type,
                 frame.body[0],
                 frame.body.len(),
@@ -750,46 +745,28 @@ impl RaknetClient {
     /// * `data` - Raw data received from the player
     #[inline]
     async fn forward_to_server(&self, data: &[u8]) {
-        if let Err(err) = self.udp_sock.send_to(data, self.server.addr).await {
+        if let Err(err) = self.udp_sock.send(data).await {
             log::debug!(
                 "{} Unable to forward data: {:?}",
-                self.debug_prefix(Direction::PlayerToServer),
+                self.prefix_p2s,
                 err
             );
         }
     }
-
-    /// Prefix for all debug messages related to this client.
-    ///
-    /// ## Arguments
-    ///
-    /// * `direction` - Data flow direction
-    fn debug_prefix(&self, direction: Direction) -> String {
-        match direction {
-            Direction::PlayerToServer => format!(
-                "[player: {} -> server {} ({})]",
-                self.addr, self.server.addr, self.udp_sock_addr
-            ),
-            Direction::ServerToPlayer => format!(
-                "[server: {} ({}) -> player {}]]",
-                self.server.addr, self.udp_sock_addr, self.addr
-            ),
-        }
-    }
 }
 
-impl DisconnectCause {
-    pub fn to_str(self) -> &'static str {
+impl fmt::Display for DisconnectCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             // We don't know whether the server sent a Disconnect GAME packet,
             // and the first disconnect notification that will be seen will be from the client.
             // Since I don't want to have to spy inside GAME packets (compression, encryption,
             // incur CPU cost, etc) it will most likely remain like this.
-            Self::Client => "normal",
-            Self::Server => "server",
-            Self::Timeout => "timeout",
-            Self::Error => "unexpected error",
-            Self::Unknown => "unknown",
+            Self::Client => write!(f, "normal"),
+            Self::Server => write!(f, "server"),
+            Self::Timeout => write!(f, "timeout"),
+            Self::Error => write!(f, "unexpected error"),
+            Self::Unknown => write!(f, "unknown"),
         }
     }
 }

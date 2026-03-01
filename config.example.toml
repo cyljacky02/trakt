@@ -17,6 +17,14 @@ load_balance_method = "round_robin"
 # You may need to configure your server software to support it.
 proxy_protocol = true
 
+# Session timeout configuration (in seconds).
+# These have sensible defaults and are optional.
+[timeouts]
+# Handshake phase timeout. Incomplete handshakes are dropped after this.
+handshake = 5
+# Backend silence timeout. No response from backend = disconnect.
+backend_silence = 10
+
 [backend]
 # Rate, in seconds, at which to ping servers for heatlh checks.
 health_check_rate = 5

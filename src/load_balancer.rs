@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock};
@@ -43,7 +43,9 @@ enum LoadBalanceAlgorithm {
 pub struct BackendServer {
     /// Remote address of the server.
     pub addr: SocketAddr,
-    /// Current health status.
+    /// Whether the server is alive (atomic for fast reads).
+    pub alive: AtomicBool,
+    /// Detailed health status.
     pub health: RwLock<ServerHealth>,
     /// Current number of clients assigned to that server.
     pub load: AtomicUsize,
@@ -53,6 +55,7 @@ impl BackendServer {
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             addr,
+            alive: AtomicBool::new(false),
             health: RwLock::new(ServerHealth::default()),
             load: AtomicUsize::new(0),
         }
@@ -81,13 +84,13 @@ impl LoadBalancer {
             algo,
             servers: Vec::new(),
         };
-        let __self = Self {
+        let lb = Self {
             config_provider,
             state: Mutex::new(state),
             health_controller,
         };
-        __self.load_config(false).await;
-        __self
+        lb.load_config(false).await;
+        lb
     }
 
     /// Reloads configuration.
@@ -165,7 +168,7 @@ impl LoadBalancer {
         }
     }
 
-    /// Gets an active backend server for a given adrress.
+    /// Gets an active backend server for a given address.
     ///
     /// If the server exists but is stale (load balancer doesn't know it),
     /// it will return [`None`].
@@ -188,19 +191,13 @@ impl LoadBalancer {
         if server_count == 0 {
             return None;
         }
-        // when all backend servers are marked as alive
+        // when no backend servers are marked as alive
         // it might be an issue specific to pings, hence we still
         // want to allow players to attempt joining even if health status is wrong
-        let respect_alive_status = {
-            let mut alive_count = 0;
-            for server in state.servers.iter() {
-                let health = server.health.read().await;
-                if health.alive {
-                    alive_count += 1;
-                }
-            }
-            alive_count > 0
-        };
+        let respect_alive_status = state
+            .servers
+            .iter()
+            .any(|s| s.alive.load(Ordering::Acquire));
         log::debug!(
             "Getting next server from load balancer (algo: {:?}, respect_alive_status: {})",
             &state.algo,
@@ -223,8 +220,7 @@ impl LoadBalancer {
                     };
                     match state.servers.get(index) {
                         Some(server) if respect_alive_status => {
-                            let health = server.health.read().await;
-                            if !health.alive {
+                            if !server.alive.load(Ordering::Acquire) {
                                 continue;
                             }
                             return Some(server.clone());
@@ -239,14 +235,11 @@ impl LoadBalancer {
                 let mut min_load = usize::MAX;
                 let mut target = None;
                 for server in state.servers.iter() {
+                    if respect_alive_status && !server.alive.load(Ordering::Acquire) {
+                        continue;
+                    }
                     let load = server.load.load(Ordering::Acquire);
                     if load < min_load {
-                        if respect_alive_status {
-                            let health = server.health.read().await;
-                            if !health.alive {
-                                continue;
-                            }
-                        }
                         min_load = load;
                         target = Some(server.clone());
                     }

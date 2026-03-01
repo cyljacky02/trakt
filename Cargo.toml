@@ -1,27 +1,28 @@
 [package]
 name = "trakt"
 description = "Reverse proxy and load balancer for Minecraft: Bedrock Edition"
-version = "0.1.1"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/Unoqwy/trakt"
 readme = "README-cratesio.md"
 keywords = ["minecraft", "bedrock", "proxy"]
 
 [dependencies]
-clap = { version = "4.3", features = ["derive"] }
-log = "0.4.20"
-simple_logger = "4.2"
+clap = { version = "4.5", features = ["derive"] }
+log = "0.4"
+simple_logger = "5"
 
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-toml = "0.7"
+toml = "0.8"
 
-fdlimit = "0.2.1"
+fdlimit = "0.3"
 anyhow = "1.0"
-bytes = "1.4"
+bytes = "1.9"
 rand = "0.8"
-tokio = { version = "1.32", features = ["full"] }
+tokio = { version = "1.49", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "signal", "macros"] }
+tokio-util = "0.7"
 ppp = "2.2"
 
 [[bin]]

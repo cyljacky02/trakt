@@ -1,8 +1,6 @@
 mod offline;
-mod online;
 
 pub use offline::*;
-pub use online::*;
 
 use super::datatypes::{BufError, ReadBuf, WriteBuf};
 

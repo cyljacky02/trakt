@@ -29,8 +29,40 @@ pub struct RootConfig {
     pub load_balance_method: Option<LoadBalanceMethod>,
     /// Whether proxy protocol should be used. Defaults to true.
     pub proxy_protocol: Option<bool>,
+    /// Session timeout configuration.
+    #[serde(default)]
+    pub timeouts: TimeoutsConfig,
     /// Backend to route players to.
     pub backend: BackendConfig,
+}
+
+/// Phase-specific timeout configuration (in seconds).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeoutsConfig {
+    /// Handshake phase timeout. Fail fast for incomplete handshakes.
+    #[serde(default = "TimeoutsConfig::default_handshake")]
+    pub handshake: u64,
+    /// Backend silence timeout. No response from backend in connected state.
+    #[serde(default = "TimeoutsConfig::default_backend_silence")]
+    pub backend_silence: u64,
+}
+
+impl Default for TimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            handshake: Self::default_handshake(),
+            backend_silence: Self::default_backend_silence(),
+        }
+    }
+}
+
+impl TimeoutsConfig {
+    fn default_handshake() -> u64 {
+        5
+    }
+    fn default_backend_silence() -> u64 {
+        10
+    }
 }
 
 /// Load balancing method.

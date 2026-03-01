@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Weak},
+    sync::{
+        atomic::Ordering,
+        Arc, Weak,
+    },
     time::Duration,
 };
 
@@ -17,7 +20,7 @@ pub struct HealthController {
     /// Config provider.
     config_provider: Arc<ConfigProvider>,
 
-    /// Knonwn backend servers. This may include stale servers that are
+    /// Known backend servers. This may include stale servers that are
     /// no longer used by the load balancer.
     servers: Mutex<Vec<Weak<BackendServer>>>,
 }
@@ -51,7 +54,7 @@ impl HealthController {
     /// Executes a health check of all servers.
     /// Stale servers that have finished being used will be removed here too.
     pub async fn execute(&self) {
-        let _permit = self.execute_lock.acquire();
+        let _permit = self.execute_lock.acquire().await;
         let (local_addr, proxy_protocol) = {
             let config = self.config_provider.read().await;
             let proxy_protocol = config.proxy_protocol.unwrap_or(true);
@@ -72,11 +75,7 @@ impl HealthController {
         }
         drop(servers);
         log::debug!("Checking health of {} backend servers...", join_set.len());
-        loop {
-            if join_set.join_next().await.is_none() {
-                break;
-            }
-        }
+        join_set.join_all().await;
     }
 
     /// Performs a health check on server.
@@ -97,6 +96,7 @@ impl HealthController {
         }
         let alive = health.alive;
         drop(health);
+        server.alive.store(alive, Ordering::Release);
         if prev_alive != alive {
             if alive {
                 log::info!("Backend server {} is now alive", &server.addr);

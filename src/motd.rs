@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use tokio::sync::{RwLock, Semaphore};
+use tokio::{sync::{RwLock, Semaphore}, task::JoinSet};
 
 use crate::{
     config::ConfigProvider,
@@ -28,12 +28,12 @@ impl MOTDReflector {
         }
     }
 
-    /// Returns a clone of the last sucessful MOTD information received.
+    /// Returns a clone of the last successful MOTD information received.
     pub async fn last_motd(&self) -> Option<Motd> {
         self.last_motd.read().await.clone()
     }
 
-    /// Fetches the MOTD.
+    /// Fetches the MOTD concurrently from all sources, takes first success.
     pub async fn execute(&self) {
         let _permit = self.execute_lock.acquire().await;
         let (local_addr, sources, proxy_protocol) = {
@@ -56,8 +56,17 @@ impl MOTDReflector {
             sources.len()
         );
         let timeout = Duration::from_secs(5);
+        let mut join_set = JoinSet::new();
         for source in sources.into_iter() {
-            match ping::ping(&local_addr, &source, proxy_protocol, timeout).await {
+            let local_addr = local_addr.clone();
+            join_set.spawn(async move {
+                let result = ping::ping(&local_addr, &source, proxy_protocol, timeout).await;
+                (source, result)
+            });
+        }
+        // Take first successful result
+        while let Some(Ok((source, result))) = join_set.join_next().await {
+            match result {
                 Ok(motd) => {
                     log::debug!(
                         "Successfully fetched MOTD information from source {}: {:?}",
@@ -66,6 +75,7 @@ impl MOTDReflector {
                     );
                     let mut w = self.last_motd.write().await;
                     *w = Some(motd);
+                    return;
                 }
                 Err(err) => {
                     log::warn!(
