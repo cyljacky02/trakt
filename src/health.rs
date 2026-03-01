@@ -78,19 +78,9 @@ impl HealthController {
     /// Performs a health check on server.
     async fn check_health(local_addr: String, proxy_protocol: bool, server: Arc<BackendServer>) {
         let timeout = Duration::from_secs(5);
-        // Try with proxy protocol first if configured, fall back to raw ping.
-        let success = if proxy_protocol {
-            ping::ping(&local_addr, &server.addr, true, timeout)
-                .await
-                .is_ok()
-                || ping::ping(&local_addr, &server.addr, false, timeout)
-                    .await
-                    .is_ok()
-        } else {
-            ping::ping(&local_addr, &server.addr, false, timeout)
-                .await
-                .is_ok()
-        };
+        let success = ping::ping(&local_addr, &server.addr, proxy_protocol, timeout)
+            .await
+            .is_ok();
         let mut health = server.health.write().await;
         let prev_alive = health.alive;
         if success {
