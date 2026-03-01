@@ -2,9 +2,9 @@ use std::{path::PathBuf, process::exit, str::FromStr, sync::Arc};
 
 use clap::Parser;
 use config::ConfigProvider;
-use log::LevelFilter;
 use proxy::RaknetProxy;
-use simple_logger::SimpleLogger;
+use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::prelude::*;
 use tokio::io::AsyncBufReadExt;
 
 mod config;
@@ -40,24 +40,27 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let log_level = match args.verbose {
-        0 => LevelFilter::Info,
-        1 => LevelFilter::Debug,
-        _ => LevelFilter::Trace,
+    let default_level = match args.verbose {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
     };
-    SimpleLogger::new()
-        .with_level(log_level)
-        .with_colors(!args.no_color)
-        .init()
-        .unwrap();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_level));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer()
+            .with_target(true)
+            .with_ansi(!args.no_color))
+        .init();
 
     if args.raise_ulimit {
         match fdlimit::raise_fd_limit() {
             Ok(fdlimit::Outcome::LimitRaised { from, to }) => {
-                log::info!("Raised ulimit from {} to {}", from, to);
+                tracing::info!(from, to, "Raised ulimit");
             }
-            Ok(_) => log::info!("Ulimit unchanged"),
-            Err(err) => log::warn!("Failed to raise ulimit: {}", err),
+            Ok(_) => tracing::info!("Ulimit unchanged"),
+            Err(err) => tracing::warn!(%err, "Failed to raise ulimit"),
         }
     }
 
@@ -68,10 +71,10 @@ fn main() {
     let config_provider = match config::read_config(config_file.clone()) {
         Ok(config) => config,
         Err(err) => {
-            log::error!(
-                "Could not read configuration file ({}): {}",
-                config_file.to_string_lossy(),
-                err
+            tracing::error!(
+                config_file = %config_file.to_string_lossy(),
+                %err,
+                "Could not read configuration file"
             );
             return;
         }
@@ -83,7 +86,7 @@ fn main() {
 async fn run(config_provider: ConfigProvider, args: Args) {
     let bind_address = {
         let config = config_provider.read().await;
-        log::debug!("Parsed configuration: {:#?}", config);
+        tracing::debug!(?config, "Parsed configuration");
         config.bind_address.clone()
     };
     let config_provider = Arc::new(config_provider);
@@ -95,7 +98,7 @@ async fn run(config_provider: ConfigProvider, args: Args) {
             let proxy = proxy.clone();
             let config_provider = config_provider.clone();
             async move {
-                log::info!("Console commands enabled");
+                tracing::info!("Console commands enabled");
                 run_stdin_handler(proxy, config_provider).await;
             }
         });
@@ -112,7 +115,7 @@ async fn run(config_provider: ConfigProvider, args: Args) {
                         if shutdown_requests >= 3 {
                             exit(1);
                         }
-                        log::info!("Shutdown requested...");
+                        tracing::info!("Shutdown requested...");
                         proxy.cleanup().await;
                         exit(0);
                     }
@@ -124,7 +127,7 @@ async fn run(config_provider: ConfigProvider, args: Args) {
         }
     });
     if let Err(err) = proxy.clone().run().await {
-        log::error!("{}", err);
+        tracing::error!(%err, "Proxy run failed");
     }
     proxy.cleanup().await;
 }
@@ -136,7 +139,7 @@ async fn run_stdin_handler(proxy: Arc<RaknetProxy>, config_provider: Arc<ConfigP
         let len = match reader.read_line(&mut buf).await {
             Ok(line) => line,
             Err(err) => {
-                log::error!("Error reading user input: {:?}", err);
+                tracing::error!(?err, "Error reading user input");
                 continue;
             }
         };
@@ -145,18 +148,18 @@ async fn run_stdin_handler(proxy: Arc<RaknetProxy>, config_provider: Arc<ConfigP
             "reload" => config_provider.reload().await,
             "list" | "load" => {
                 let overview = proxy.load_overview();
-                log::info!(
-                    "There are {} online players ({} active clients). Breakdown: {:?}",
-                    overview.connected_count,
-                    overview.client_count,
-                    overview.per_server
+                tracing::info!(
+                    connected_count = overview.connected_count,
+                    client_count = overview.client_count,
+                    ?overview.per_server,
+                    "Load overview"
                 )
             }
             "metrics" | "stats" => {
                 let snapshot = proxy.metrics().snapshot();
-                log::info!("Metrics: {}", snapshot);
+                tracing::info!(%snapshot, "Metrics");
             }
-            _ => log::warn!("Unknown command '{}'", line),
+            _ => tracing::warn!(command = %line, "Unknown command"),
         }
     }
 }

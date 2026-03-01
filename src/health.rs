@@ -71,7 +71,7 @@ impl HealthController {
             });
         }
         drop(servers);
-        log::debug!("Checking health of {} backend servers...", join_set.len());
+        tracing::debug!(count = join_set.len(), "Checking health of backend servers");
         join_set.join_all().await;
     }
 
@@ -96,9 +96,9 @@ impl HealthController {
         server.alive.store(alive, Ordering::Release);
         if prev_alive != alive {
             if alive {
-                log::info!("Backend server {} is now alive", &server.addr);
+                tracing::info!(server_addr = %server.addr, "Backend server is now alive");
             } else {
-                log::warn!("Backend server {} seems unreachable", &server.addr);
+                tracing::warn!(server_addr = %server.addr, "Backend server seems unreachable");
             }
         }
     }

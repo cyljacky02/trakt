@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use log::log_enabled;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, RwLock, RwLockReadGuard};
 
@@ -132,17 +131,17 @@ impl ConfigProvider {
         let config = match self.read_config().await {
             Ok(config) => config,
             Err(err) => {
-                log::error!("Unable to reload config file: {:?}", err);
+                tracing::error!(?err, "Unable to reload config file");
                 return;
             }
         };
         let mut w = self.config.write().await;
         *w = config;
         drop(w);
-        log::info!("Config file reloaded.");
-        if log_enabled!(log::Level::Debug) {
+        tracing::info!("Config file reloaded.");
+        if tracing::enabled!(tracing::Level::DEBUG) {
             let config = self.read().await;
-            log::debug!("Parsed configuration: {:#?}", config);
+            tracing::debug!(?config, "Parsed configuration");
         }
         self.reload_notify.notify_waiters();
     }

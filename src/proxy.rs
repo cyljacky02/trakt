@@ -5,6 +5,7 @@ use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::{self, Instrument};
 
 use crate::config::ConfigProvider;
 use crate::health::HealthController;
@@ -95,10 +96,8 @@ struct RaknetClient {
     /// Semaphore used to wait for guaranteed close state.
     close_lock: Semaphore,
 
-    /// Cached debug prefix string (player→server direction).
-    prefix_p2s: String,
-    /// Cached debug prefix string (server→player direction).
-    prefix_s2p: String,
+    /// Tracing span for this client session.
+    span: tracing::Span,
 }
 
 /// Result of spying into a datagram packet.
@@ -285,9 +284,9 @@ impl RaknetProxy {
     /// If stopped gracefully it will return `Ok(())`, otherwise it will return an error.
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         self.start_background_tasks();
-        log::info!(
-            "Starting Raknet proxy server on {}",
-            self.in_udp_sock.local_addr()?
+        tracing::info!(
+            bind_addr = %self.in_udp_sock.local_addr()?,
+            "Starting Raknet proxy server"
         );
 
         let udp_sock = self.in_udp_sock.clone();
@@ -325,7 +324,7 @@ impl RaknetProxy {
                     // fall through to slow path for re-connection handling
                 } else {
                     if let Err(err) = client.udp_sock.send(&buf[..len]).await {
-                        log::debug!("{} Unable to forward data: {:?}", client.prefix_p2s, err);
+                        tracing::debug!(parent: &client.span, ?err, direction = "p2s", "Unable to forward data");
                     }
                     // Spy for disconnect in datagrams
                     if raknet::is_datagram(buf[0]) {
@@ -334,10 +333,7 @@ impl RaknetProxy {
                             client.spy_datagram(Direction::PlayerToServer, data),
                             Ok(SpyDatagramResult::Disconnect)
                         ) {
-                            log::debug!(
-                                "{} Found disconnect notification in datagram",
-                                client.prefix_p2s,
-                            );
+                            tracing::debug!(parent: &client.span, direction = "p2s", "Found disconnect notification in datagram");
                             let _ = client.close_tx.send(DisconnectCause::Client).await;
                         }
                     }
@@ -351,7 +347,7 @@ impl RaknetProxy {
             let permit = match self.slow_path_semaphore.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
-                    log::warn!("[{}] Slow-path backpressure: dropping packet", addr);
+                    tracing::warn!(%addr, "Slow-path backpressure: dropping packet");
                     self.metrics.packets_dropped.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -360,11 +356,7 @@ impl RaknetProxy {
                 let proxy = self.clone();
                 async move {
                     if let Err(err) = proxy.handle_recv_slow(addr, data).await {
-                        log::debug!(
-                            "[{}] Unable to handle player -> server UDP datagram message: {:?}",
-                            addr,
-                            err
-                        );
+                        tracing::debug!(%addr, ?err, "Unable to handle player -> server UDP datagram message");
                     }
                     drop(permit);
                 }
@@ -406,20 +398,16 @@ impl RaknetProxy {
             (_, Some(client)) if client.is_connected() => {
                 // Connected client that wasn't caught in fast path (race) — just relay
                 if let Err(err) = client.handle_incoming_player(data).await {
-                    log::debug!(
-                        "{} Unable to handle UDP datagram message: {:?}",
-                        client.prefix_p2s,
-                        err
-                    );
+                    tracing::debug!(parent: &client.span, ?err, direction = "p2s", "Unable to handle UDP datagram message");
                 }
             }
             (Some(message_type), mut client) => {
-                log::trace!("[{}] Received offline message {:?}", addr, message_type);
+                tracing::trace!(%addr, ?message_type, "Received offline message");
                 if client.is_none() || message_type.eq(&RaknetMessage::OpenConnectionRequest1) {
                     // Rate limit new session creation
                     let rl = self.rate_limiter.check_new_session(addr.ip());
                     if rl != RateLimitResult::Allow {
-                        log::debug!("[{}] New session blocked: {:?}", addr, rl);
+                        tracing::debug!(%addr, ?rl, "New session blocked");
                         return Ok(());
                     }
                     if let Some(client) = client {
@@ -466,7 +454,7 @@ impl RaknetProxy {
             Some(server) => server,
             None => match self.load_balancer.next().await {
                 Some(server) => {
-                    log::debug!("[{}] Picked server {}", addr, server.addr);
+                    tracing::debug!(%addr, server_addr = %server.addr, "Picked server");
                     server
                 }
                 None => return Err(anyhow::anyhow!("No server available to proxy this player")),
@@ -478,13 +466,11 @@ impl RaknetProxy {
         let udp_sock_addr = sock.local_addr()?;
 
         let (tx, rx) = mpsc::channel(1);
-        let prefix_p2s = format!(
-            "[player: {} -> server {} ({})]",
-            addr, server.addr, udp_sock_addr
-        );
-        let prefix_s2p = format!(
-            "[server: {} ({}) -> player {}]",
-            server.addr, udp_sock_addr, addr
+        let span = tracing::info_span!(
+            "session",
+            client_addr = %addr,
+            server_addr = %server.addr,
+            local_addr = %udp_sock_addr,
         );
         let client = Arc::new(RaknetClient {
             addr,
@@ -495,8 +481,7 @@ impl RaknetProxy {
             stage: AtomicU8::new(stage),
             close_tx: tx,
             close_lock: Semaphore::new(0),
-            prefix_p2s,
-            prefix_s2p,
+            span,
         });
 
         // Scope the write lock so it's dropped before any .await
@@ -515,6 +500,7 @@ impl RaknetProxy {
         self.metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
         tokio::spawn({
             let client = client.clone();
+            let span = client.span.clone();
             let clients = self.clients.clone();
             let metrics = self.metrics.clone();
             let rate_limiter = self.rate_limiter.clone();
@@ -542,20 +528,11 @@ impl RaknetProxy {
                 metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                 let cause = match loop_result {
                     Ok(cause) => {
-                        log::debug!(
-                            "Connection closed: {} | {} total",
-                            client.addr,
-                            client_count,
-                        );
+                        tracing::debug!(client_count, "Connection closed");
                         cause
                     }
                     Err(err) => {
-                        log::debug!(
-                            "Connection closed unexpectedly for {}: {} | {} total",
-                            client.addr,
-                            err,
-                            client_count
-                        );
+                        tracing::debug!(%err, client_count, "Connection closed unexpectedly");
                         DisconnectCause::Error
                     }
                 };
@@ -563,21 +540,15 @@ impl RaknetProxy {
                     metrics.timeout_disconnects.fetch_add(1, Ordering::Relaxed);
                 }
                 if was_connected {
-                    log::info!(
-                        "Player {} has disconnected from {} ({})",
-                        client.addr,
-                        client.server.addr,
-                        cause,
-                    )
+                    tracing::info!(%cause, "Player disconnected");
                 }
             }
+            .instrument(span)
         });
-        log::debug!(
-            "Client initialized: {} <-> {} ({}) | {} total",
-            client.addr,
-            client.server.addr,
-            client.udp_sock_addr,
-            total
+        tracing::debug!(
+            parent: &client.span,
+            total,
+            "Client initialized"
         );
         if proxy_protocol {
             client.send_haproxy_info().await?;
@@ -680,18 +651,10 @@ impl RaknetClient {
                             )
                             .is_ok()
                     {
-                        log::info!(
-                            "Player {} has connected to {}",
-                            self.addr,
-                            self.server.addr
-                        )
+                        tracing::info!("Player connected")
                     }
                     if let Some(ref mt) = message_type {
-                        log::trace!(
-                            "{} Relaying message {:?}",
-                            self.prefix_s2p,
-                            mt
-                        );
+                        tracing::trace!(?mt, direction = "s2p", "Relaying message");
                     }
                     // Spy for disconnect
                     let data = Bytes::copy_from_slice(&buf[..len]);
@@ -699,10 +662,7 @@ impl RaknetClient {
                         self.spy_datagram(Direction::ServerToPlayer, data),
                         Ok(SpyDatagramResult::Disconnect)
                     ) {
-                        log::debug!(
-                            "{} Found disconnect notification in datagram",
-                            self.prefix_s2p,
-                        );
+                        tracing::debug!(direction = "s2p", "Found disconnect notification in datagram");
                         self.close_tx.send(DisconnectCause::Server).await?;
                     }
                 }
@@ -718,7 +678,7 @@ impl RaknetClient {
     #[inline]
     async fn forward_to_player(&self, data: &[u8]) {
         if let Err(err) = self.proxy_udp_sock.send_to(data, self.addr).await {
-            log::debug!("{} Unable to forward data: {:?}", self.prefix_s2p, err);
+            tracing::debug!(?err, direction = "s2p", "Unable to forward data");
         }
     }
 
@@ -732,11 +692,7 @@ impl RaknetClient {
             return Ok(());
         }
         if data[0] & 0x80 == 0 {
-            log::trace!(
-                "{} Received non-datagram data, with header {:02x}",
-                self.prefix_p2s,
-                data[0]
-            );
+            tracing::trace!(header = format_args!("{:02x}", data[0]), direction = "p2s", "Received non-datagram data");
             // while this is technically invalid,
             // not forwarding it would make the proxy inconsistent
             self.forward_to_server(&data).await;
@@ -747,11 +703,8 @@ impl RaknetClient {
             self.spy_datagram(Direction::PlayerToServer, data),
             Ok(SpyDatagramResult::Disconnect)
         ) {
-            log::debug!(
-                "{} Found disconnect notification in datagram",
-                self.prefix_p2s,
-            );
-            self.close_tx.send(DisconnectCause::Client).await?;
+            tracing::debug!(direction = "p2s", "Found disconnect notification in datagram");
+            self.close_tx.send(DisconnectCause::Client).await?
         }
         Ok(())
     }
@@ -784,16 +737,12 @@ impl RaknetClient {
                 continue;
             }
             let message_type = RaknetMessage::from_u8(frame.body[0]);
-            let prefix = match direction {
-                Direction::PlayerToServer => &self.prefix_p2s,
-                Direction::ServerToPlayer => &self.prefix_s2p,
-            };
-            log::trace!(
-                "{} Frame with message type {:?} ({:02x}) and body size {}",
-                prefix,
-                message_type,
-                frame.body[0],
-                frame.body.len(),
+            tracing::trace!(
+                ?direction,
+                ?message_type,
+                header = format_args!("{:02x}", frame.body[0]),
+                body_size = frame.body.len(),
+                "Frame inspected",
             );
             if matches!(message_type, Some(RaknetMessage::DisconnectNotification)) {
                 return Ok(SpyDatagramResult::Disconnect);
@@ -810,7 +759,7 @@ impl RaknetClient {
     #[inline]
     async fn forward_to_server(&self, data: &[u8]) {
         if let Err(err) = self.udp_sock.send(data).await {
-            log::debug!("{} Unable to forward data: {:?}", self.prefix_p2s, err);
+            tracing::debug!(?err, direction = "p2s", "Unable to forward data");
         }
     }
 }

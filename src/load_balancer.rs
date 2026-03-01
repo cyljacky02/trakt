@@ -129,18 +129,18 @@ impl LoadBalancer {
             let addr = match SocketAddr::from_str(&config_server.address) {
                 Ok(addr) => addr,
                 Err(err) => {
-                    log::error!(
-                        "Could not load configured backend server with address {}: {:?}",
-                        config_server.address,
-                        err
+                    tracing::error!(
+                        address = %config_server.address,
+                        ?err,
+                        "Could not load configured backend server"
                     );
                     continue;
                 }
             };
             if !seen.insert(addr) {
-                log::warn!(
-                    "Duplicate backend server pointing to {} in configuration",
-                    addr
+                tracing::warn!(
+                    %addr,
+                    "Duplicate backend server in configuration"
                 );
                 continue;
             }
@@ -157,14 +157,14 @@ impl LoadBalancer {
         state.servers.retain(|server| seen.contains(&server.addr));
         let removed_count = server_count - state.servers.len();
         if reload || removed_count > 0 {
-            log::info!(
-                "Reloaded load balancer. There are now {} backend servers ({} added, {} removed)",
-                state.servers.len(),
-                new_count,
-                removed_count
+            tracing::info!(
+                total = state.servers.len(),
+                added = new_count,
+                removed = removed_count,
+                "Reloaded load balancer"
             );
         } else {
-            log::info!("Loaded {} backend servers", new_count);
+            tracing::info!(count = new_count, "Loaded backend servers");
         }
     }
 
@@ -184,10 +184,10 @@ impl LoadBalancer {
             .servers
             .iter()
             .any(|s| s.alive.load(Ordering::Acquire));
-        log::debug!(
-            "Getting next server from load balancer (algo: {:?}, respect_alive_status: {})",
-            &state.algo,
-            respect_alive_status
+        tracing::debug!(
+            algo = ?state.algo,
+            respect_alive_status,
+            "Getting next server from load balancer"
         );
         match &state.algo {
             LoadBalanceAlgorithm::RoundRobin { .. } => {

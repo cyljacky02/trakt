@@ -54,10 +54,7 @@ impl MOTDReflector {
             let proxy_protocol = config.proxy_protocol.unwrap_or(true);
             (config.proxy_bind.clone(), sources, proxy_protocol)
         };
-        log::debug!(
-            "Fetching MOTD information from backend ({} sources)...",
-            sources.len()
-        );
+        tracing::debug!(source_count = sources.len(), "Fetching MOTD information from backend");
         let timeout = Duration::from_secs(5);
         let mut join_set = JoinSet::new();
         for source in sources.into_iter() {
@@ -71,21 +68,13 @@ impl MOTDReflector {
         while let Some(Ok((source, result))) = join_set.join_next().await {
             match result {
                 Ok(motd) => {
-                    log::debug!(
-                        "Successfully fetched MOTD information from source {}: {:?}",
-                        source,
-                        motd
-                    );
+                    tracing::debug!(%source, ?motd, "Successfully fetched MOTD information");
                     let mut w = self.last_motd.write().await;
                     *w = Some(motd);
                     return;
                 }
                 Err(err) => {
-                    log::warn!(
-                        "Could not fetch MOTD information from source {}: {:?}",
-                        source,
-                        err
-                    );
+                    tracing::warn!(%source, ?err, "Could not fetch MOTD information");
                 }
             }
         }

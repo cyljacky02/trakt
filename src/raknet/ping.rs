@@ -220,7 +220,7 @@ async fn ping_resender(udp_sock: Arc<UdpSocket>, ping_packet: &[u8]) -> anyhow::
     let mut attempts = 0;
     loop {
         attempts += 1;
-        log::trace!("Ping attempt #{} to {}", attempts, udp_sock.peer_addr()?);
+        tracing::trace!(attempt = attempts, peer = %udp_sock.peer_addr()?, "Ping attempt");
         udp_sock.send(ping_packet).await?;
         tokio::time::sleep(Duration::from_millis(750)).await;
     }

@@ -1,73 +1,75 @@
-use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::time::Instant;
+use std::num::NonZeroU32;
+use std::time::{Duration, Instant};
 
-/// Per-IP rate limiter using a sliding window counter approach.
-/// All operations are O(1) per packet. Cleanup is amortized.
-pub struct RateLimiter {
-    /// Per-IP packet counters with window timestamps.
-    entries: Mutex<HashMap<IpAddr, IpEntry>>,
-    /// Maximum packets per second per IP.
-    pps_limit: u32,
-    /// Maximum concurrent sessions per IP.
-    session_limit: u32,
-    /// Maximum new sessions per second globally.
-    global_session_pps: u32,
-    /// Maximum unconnected pings per second per IP.
-    ping_pps_limit: u32,
-    /// Maximum packets per second per connected session.
-    session_pps_limit: u32,
-    /// Minimum valid packet size in bytes.
-    min_packet_size: usize,
-    /// Maximum valid packet size in bytes.
-    max_packet_size: usize,
-    /// Handshake failures before temporary ban.
-    max_handshake_failures: u32,
-    /// Temporary ban duration in seconds.
-    ban_duration_secs: u64,
+use dashmap::DashMap;
+use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota, RateLimiter as GovRateLimiter};
+use serde::{Deserialize, Serialize};
 
-    /// Global new-session counter for current window.
-    global_session_count: AtomicU64,
-    /// Timestamp of current global session window.
-    global_session_window: Mutex<Instant>,
-}
-
-struct IpEntry {
-    /// Packet count in current window.
-    packet_count: u32,
-    /// Ping count in current window.
-    ping_count: u32,
-    /// Window start time.
-    window_start: Instant,
-    /// Active session count for this IP.
+/// Per-IP domain-specific state (session tracking and bans).
+///
+/// All fields are plain types; synchronization is provided by the containing
+/// `DashMap` shard locks. Reads use shared locks, writes use exclusive locks.
+struct IpState {
+    /// Number of active sessions for this IP.
     session_count: u32,
     /// Consecutive handshake failures.
     handshake_failures: u32,
-    /// Temporary ban expiry (if banned).
+    /// Temporary ban expiry time, if currently banned.
     banned_until: Option<Instant>,
 }
 
-impl IpEntry {
-    fn new(now: Instant) -> Self {
+impl IpState {
+    fn new() -> Self {
         Self {
-            packet_count: 0,
-            ping_count: 0,
-            window_start: now,
             session_count: 0,
             handshake_failures: 0,
             banned_until: None,
         }
     }
 
-    fn reset_window_if_expired(&mut self, now: Instant) {
-        if now.duration_since(self.window_start).as_secs() >= 1 {
-            self.packet_count = 0;
-            self.ping_count = 0;
-            self.window_start = now;
-        }
+    /// Returns true if this IP is currently banned.
+    #[inline]
+    fn is_banned(&self) -> bool {
+        self.banned_until.is_some_and(|t| Instant::now() < t)
     }
+}
+
+/// Converts a `u32` config value to `NonZeroU32`, falling back to 1 if zero.
+#[inline]
+fn nonzero(value: u32) -> NonZeroU32 {
+    NonZeroU32::new(value).unwrap_or(NonZeroU32::MIN)
+}
+
+/// GCRA-based rate limiter with domain-specific session and ban tracking.
+///
+/// Rate checks use the Generic Cell Rate Algorithm (via `governor`) for
+/// lock-free, O(1) atomic packet/ping/session rate limiting. Domain state
+/// (session counts, handshake failures, temporary bans) is stored in a
+/// sharded `DashMap` for minimal contention on the hot path.
+pub struct RateLimiter {
+    /// GCRA per-IP packet rate limiter (lock-free atomic CAS).
+    packet_limiter: DefaultKeyedRateLimiter<IpAddr>,
+    /// GCRA per-IP ping rate limiter (lock-free atomic CAS).
+    ping_limiter: DefaultKeyedRateLimiter<IpAddr>,
+    /// GCRA global new-session rate limiter (lock-free atomic CAS).
+    global_session_limiter: DefaultDirectRateLimiter,
+
+    /// Per-IP domain state: session counts, handshake failures, bans.
+    ip_state: DashMap<IpAddr, IpState>,
+
+    /// Maximum concurrent sessions per IP.
+    session_limit: u32,
+    /// Handshake failures before temporary ban.
+    max_handshake_failures: u32,
+    /// Duration of temporary bans.
+    ban_duration: Duration,
+    /// Minimum valid packet size in bytes.
+    min_packet_size: usize,
+    /// Maximum valid packet size in bytes.
+    max_packet_size: usize,
+    /// Maximum packets per second per connected session.
+    session_pps_limit: u32,
 }
 
 /// Result of a rate limit check.
@@ -92,42 +94,43 @@ pub enum RateLimitResult {
 impl RateLimiter {
     pub fn new(config: &RateLimitConfig) -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
-            pps_limit: config.per_ip_pps,
+            packet_limiter: GovRateLimiter::keyed(
+                Quota::per_second(nonzero(config.per_ip_pps)),
+            ),
+            ping_limiter: GovRateLimiter::keyed(
+                Quota::per_second(nonzero(config.per_ip_ping_pps)),
+            ),
+            global_session_limiter: GovRateLimiter::direct(
+                Quota::per_second(nonzero(config.global_new_sessions_pps)),
+            ),
+            ip_state: DashMap::new(),
             session_limit: config.per_ip_max_sessions,
-            global_session_pps: config.global_new_sessions_pps,
-            ping_pps_limit: config.per_ip_ping_pps,
-            session_pps_limit: config.per_session_pps,
+            max_handshake_failures: config.max_handshake_failures,
+            ban_duration: Duration::from_secs(config.ban_duration_secs),
             min_packet_size: config.min_packet_size,
             max_packet_size: config.max_packet_size,
-            max_handshake_failures: config.max_handshake_failures,
-            ban_duration_secs: config.ban_duration_secs,
-            global_session_count: AtomicU64::new(0),
-            global_session_window: Mutex::new(Instant::now()),
+            session_pps_limit: config.per_session_pps,
         }
     }
 
     /// Check if a packet from this IP should be allowed.
+    ///
+    /// Hot path: called for every incoming packet. Uses only a DashMap shared
+    /// read lock (for ban check) and a lock-free GCRA atomic CAS (for rate).
     pub fn check_packet(&self, ip: IpAddr, packet_len: usize) -> RateLimitResult {
         if packet_len < self.min_packet_size || packet_len > self.max_packet_size {
             return RateLimitResult::InvalidPacketSize;
         }
 
-        let now = Instant::now();
-        let mut entries = self.entries.lock().unwrap();
-        let entry = entries.entry(ip).or_insert_with(|| IpEntry::new(now));
-        entry.reset_window_if_expired(now);
-
-        if let Some(banned_until) = entry.banned_until {
-            if now < banned_until {
+        // Ban check (DashMap read lock on shard — concurrent with other reads)
+        if let Some(state) = self.ip_state.get(&ip) {
+            if state.is_banned() {
                 return RateLimitResult::IpBanned;
             }
-            entry.banned_until = None;
-            entry.handshake_failures = 0;
         }
 
-        entry.packet_count += 1;
-        if entry.packet_count > self.pps_limit {
+        // GCRA rate check (lock-free atomic CAS)
+        if self.packet_limiter.check_key(&ip).is_err() {
             return RateLimitResult::IpPpsExceeded;
         }
 
@@ -136,86 +139,70 @@ impl RateLimiter {
 
     /// Check if an unconnected ping from this IP should be allowed.
     pub fn check_ping(&self, ip: IpAddr) -> RateLimitResult {
-        let now = Instant::now();
-        let mut entries = self.entries.lock().unwrap();
-        let entry = entries.entry(ip).or_insert_with(|| IpEntry::new(now));
-        entry.reset_window_if_expired(now);
-
-        entry.ping_count += 1;
-        if entry.ping_count > self.ping_pps_limit {
+        // GCRA rate check (lock-free atomic CAS)
+        if self.ping_limiter.check_key(&ip).is_err() {
             return RateLimitResult::PingRateExceeded;
         }
-
         RateLimitResult::Allow
     }
 
     /// Check if a new session from this IP should be allowed.
+    ///
+    /// Atomically validates global rate, per-IP ban status, and session limit,
+    /// then increments the session counter if allowed.
     pub fn check_new_session(&self, ip: IpAddr) -> RateLimitResult {
-        let now = Instant::now();
-
-        // Check global rate
-        {
-            let mut window = self.global_session_window.lock().unwrap();
-            if now.duration_since(*window).as_secs() >= 1 {
-                self.global_session_count.store(0, Ordering::Relaxed);
-                *window = now;
-            }
-        }
-        let global_count = self.global_session_count.fetch_add(1, Ordering::Relaxed);
-        if global_count >= self.global_session_pps as u64 {
+        // Global rate check (lock-free atomic CAS)
+        if self.global_session_limiter.check().is_err() {
             return RateLimitResult::GlobalSessionRateExceeded;
         }
 
-        // Check per-IP limit
-        let mut entries = self.entries.lock().unwrap();
-        let entry = entries.entry(ip).or_insert_with(|| IpEntry::new(now));
+        // Per-IP checks (DashMap write lock on shard for atomic check-and-increment)
+        let mut state = self.ip_state.entry(ip).or_insert_with(IpState::new);
 
-        if let Some(banned_until) = entry.banned_until {
-            if now < banned_until {
+        // Ban check — clear expired bans inline
+        if let Some(banned_until) = state.banned_until {
+            if Instant::now() < banned_until {
                 return RateLimitResult::IpBanned;
             }
-            entry.banned_until = None;
-            entry.handshake_failures = 0;
+            state.banned_until = None;
+            state.handshake_failures = 0;
         }
 
-        if entry.session_count >= self.session_limit {
+        // Session limit check
+        if state.session_count >= self.session_limit {
             return RateLimitResult::SessionLimitExceeded;
         }
 
-        entry.session_count += 1;
+        state.session_count += 1;
         RateLimitResult::Allow
     }
 
     /// Notify that a session for this IP was closed.
     pub fn session_closed(&self, ip: IpAddr) {
-        let mut entries = self.entries.lock().unwrap();
-        if let Some(entry) = entries.get_mut(&ip) {
-            entry.session_count = entry.session_count.saturating_sub(1);
+        if let Some(mut state) = self.ip_state.get_mut(&ip) {
+            state.session_count = state.session_count.saturating_sub(1);
         }
     }
 
-    /// Record a handshake failure for this IP. May trigger a temp ban.
+    /// Record a handshake failure for this IP. May trigger a temporary ban.
     pub fn record_handshake_failure(&self, ip: IpAddr) {
-        let now = Instant::now();
-        let mut entries = self.entries.lock().unwrap();
-        let entry = entries.entry(ip).or_insert_with(|| IpEntry::new(now));
-        entry.handshake_failures += 1;
-        if entry.handshake_failures >= self.max_handshake_failures {
-            let ban_until = now + std::time::Duration::from_secs(self.ban_duration_secs);
-            entry.banned_until = Some(ban_until);
-            log::warn!(
-                "Temporarily banned {} for {} repeated handshake failures",
-                ip,
-                entry.handshake_failures
+        let mut state = self.ip_state.entry(ip).or_insert_with(IpState::new);
+        state.handshake_failures += 1;
+        if state.handshake_failures >= self.max_handshake_failures {
+            state.banned_until = Some(Instant::now() + self.ban_duration);
+            tracing::warn!(
+                %ip,
+                failures = state.handshake_failures,
+                ban_secs = self.ban_duration.as_secs(),
+                "IP temporarily banned for repeated handshake failures"
             );
         }
     }
 
     /// Record a successful handshake, resetting failure count.
     pub fn record_handshake_success(&self, ip: IpAddr) {
-        let mut entries = self.entries.lock().unwrap();
-        if let Some(entry) = entries.get_mut(&ip) {
-            entry.handshake_failures = 0;
+        if let Some(mut state) = self.ip_state.get_mut(&ip) {
+            state.handshake_failures = 0;
         }
     }
 
@@ -225,15 +212,18 @@ impl RateLimiter {
     }
 
     /// Periodic cleanup of stale entries (call every ~30s from a background task).
+    ///
+    /// Evicts expired GCRA states from governor's internal stores and removes
+    /// idle per-IP entries from the domain state map.
     pub fn cleanup_stale_entries(&self) {
-        let now = Instant::now();
-        let mut entries = self.entries.lock().unwrap();
-        entries.retain(|_, entry| {
-            let age = now.duration_since(entry.window_start).as_secs();
-            // Keep entries that have active sessions or are recently active or banned
-            entry.session_count > 0
-                || age < 60
-                || entry.banned_until.is_some_and(|t| now < t)
+        // Clean up governor's internal keyed state stores
+        self.packet_limiter.retain_recent();
+        self.ping_limiter.retain_recent();
+
+        // Clean up our own IP state — keep only entries with active sessions or unexpired bans
+        self.ip_state.retain(|_, state| {
+            state.session_count > 0
+                || state.banned_until.is_some_and(|t| Instant::now() < t)
         });
     }
 }
@@ -269,8 +259,6 @@ pub struct RateLimitConfig {
     #[serde(default = "RateLimitConfig::default_ban_duration_secs")]
     pub ban_duration_secs: u64,
 }
-
-use serde::{Deserialize, Serialize};
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
