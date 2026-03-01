@@ -20,6 +20,8 @@ pub struct MOTDReflector {
 
     /// Last successful MOTD response, if any.
     last_motd: RwLock<Option<Motd>>,
+    /// Whether the last fetch attempt failed (for recovery logging).
+    was_failing: std::sync::atomic::AtomicBool,
 }
 
 impl MOTDReflector {
@@ -28,6 +30,7 @@ impl MOTDReflector {
             execute_lock: Semaphore::new(1),
             config_provider,
             last_motd: RwLock::new(None),
+            was_failing: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -71,6 +74,12 @@ impl MOTDReflector {
         while let Some(Ok((source, result))) = join_set.join_next().await {
             match result {
                 Ok(motd) => {
+                    if self
+                        .was_failing
+                        .swap(false, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        tracing::info!(%source, "MOTD recovered after previous failure");
+                    }
                     tracing::debug!(%source, ?motd, "Successfully fetched MOTD information");
                     let mut w = self.last_motd.write().await;
                     *w = Some(motd);
@@ -81,6 +90,8 @@ impl MOTDReflector {
                 }
             }
         }
+        self.was_failing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!("All MOTD sources failed — clients will see fallback MOTD");
     }
 }
