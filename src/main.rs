@@ -52,8 +52,13 @@ fn main() {
 
     if args.raise_ulimit {
         match fdlimit::raise_fd_limit() {
-            Ok(outcome) => log::info!("Raised ulimit: {:?}", outcome),
-            Err(err) => log::warn!("Failed to raise ulimit: {:?}", err),
+            Ok(fdlimit::Outcome::LimitRaised { from, to }) => {
+                log::info!("Raised ulimit from {} to {}", from, to);
+            }
+            Ok(fdlimit::Outcome::LimitNotRaised { limit }) => {
+                log::info!("Ulimit already at {}", limit);
+            }
+            Err(err) => log::warn!("Failed to raise ulimit: {}", err),
         }
     }
 

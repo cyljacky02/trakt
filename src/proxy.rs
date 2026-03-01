@@ -427,13 +427,6 @@ impl RaknetProxy {
         sock.connect(server.addr).await?;
         let udp_sock_addr = sock.local_addr()?;
 
-        let mut clients = self.clients.write().unwrap();
-        if clients.contains_key(&addr) {
-            return Err(anyhow::anyhow!(
-                "Failed to maintain state for client {}",
-                addr
-            ));
-        }
         let (tx, rx) = mpsc::channel(1);
         let prefix_p2s = format!(
             "[player: {} -> server {} ({})]",
@@ -455,7 +448,20 @@ impl RaknetProxy {
             prefix_p2s,
             prefix_s2p,
         });
-        clients.insert(addr, client.clone());
+
+        // Scope the write lock so it's dropped before any .await
+        let total = {
+            let mut clients = self.clients.write().unwrap();
+            if clients.contains_key(&addr) {
+                return Err(anyhow::anyhow!(
+                    "Failed to maintain state for client {}",
+                    addr
+                ));
+            }
+            clients.insert(addr, client.clone());
+            clients.len()
+        };
+
         self.metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
         tokio::spawn({
             let client = client.clone();
@@ -513,7 +519,7 @@ impl RaknetProxy {
             client.addr,
             client.server.addr,
             client.udp_sock_addr,
-            clients.len()
+            total
         );
         if proxy_protocol {
             client.send_haproxy_info().await?;
