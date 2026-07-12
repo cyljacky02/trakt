@@ -66,7 +66,8 @@ impl MOTDReflector {
         for source in sources.into_iter() {
             let local_addr = local_addr.clone();
             join_set.spawn(async move {
-                let result = ping::ping(&local_addr, &source, proxy_protocol, timeout).await;
+                let result =
+                    ping::ping_with_fallback(&local_addr, &source, proxy_protocol, timeout).await;
                 (source, result)
             });
         }
