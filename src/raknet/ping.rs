@@ -216,6 +216,35 @@ pub async fn ping<A1: ToSocketAddrs, A2: ToSocketAddrs>(
     Ok(motd)
 }
 
+/// Pings a server honoring `proxy_protocol`, retrying once without proxy
+/// protocol when the wrapped ping fails.
+///
+/// Geyser sometimes ignores proxy-protocol-wrapped `UnconnectedPing` packets,
+/// so a proxy-protocol-enabled backend that does not answer the wrapped ping
+/// may still answer a raw one. Without this fallback such a backend would be
+/// reported dead by health checks and MOTD-less, even though real client
+/// traffic works.
+///
+/// # Arguments
+///
+/// * `local_addr` - Local address to bind to for the ping
+/// * `addr` - Address of the server to ping
+/// * `proxy_protocol` - Whether proxy protocol is required by the server
+/// * `timeout` - Timeout duration for each attempt
+pub async fn ping_with_fallback<A1: ToSocketAddrs + Copy, A2: ToSocketAddrs + Copy>(
+    local_addr: A1,
+    addr: A2,
+    proxy_protocol: bool,
+    timeout: Duration,
+) -> anyhow::Result<Motd> {
+    let result = ping(local_addr, addr, proxy_protocol, timeout).await;
+    if result.is_err() && proxy_protocol {
+        tracing::debug!("Proxy-protocol ping failed, retrying without proxy protocol");
+        return ping(local_addr, addr, false, timeout).await;
+    }
+    result
+}
+
 async fn ping_resender(udp_sock: Arc<UdpSocket>, ping_packet: &[u8]) -> anyhow::Result<()> {
     let mut attempts = 0;
     loop {
@@ -223,5 +252,85 @@ async fn ping_resender(udp_sock: Arc<UdpSocket>, ping_packet: &[u8]) -> anyhow::
         tracing::trace!(attempt = attempts, peer = %udp_sock.peer_addr()?, "Ping attempt");
         udp_sock.send(ping_packet).await?;
         tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PROXY protocol v2 signature prefixing every wrapped datagram.
+    const PP_V2_SIGNATURE: [u8; 12] = [
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+    ];
+
+    fn test_motd() -> Motd {
+        Motd {
+            server_uuid: 42,
+            edition: BedrockEdition::PocketEdition,
+            protocol_version: 800,
+            version_name: "1.21.0".to_string(),
+            lines: ["Geyser-like".to_string(), "backend".to_string()],
+            player_count: 0,
+            max_player_count: 10,
+            gamemode: GameMode::Survival,
+            nintendo_limited: false,
+            port_v4: 19132,
+            port_v6: 19133,
+        }
+    }
+
+    /// Fake backend that ignores proxy-protocol-wrapped pings (as Geyser
+    /// sometimes does) but answers raw `UnconnectedPing`s with a pong.
+    async fn spawn_pp_ignoring_backend() -> anyhow::Result<String> {
+        let sock = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = sock.local_addr()?.to_string();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1492];
+            loop {
+                let Ok((len, peer)) = sock.recv_from(&mut buf).await else {
+                    return;
+                };
+                if buf[..len].starts_with(&PP_V2_SIGNATURE) {
+                    // Geyser-like behavior: silently drop wrapped pings.
+                    continue;
+                }
+                let pong = MessageUnconnectedPong {
+                    timestamp: 0,
+                    server_uuid: 42,
+                    motd: test_motd().encode_payload(),
+                };
+                let reply = pong.to_bytes().expect("pong encodes");
+                let _ = sock.send_to(&reply, peer).await;
+            }
+        });
+        Ok(addr)
+    }
+
+    #[tokio::test]
+    async fn fallback_reaches_backend_that_ignores_proxy_protocol_pings() {
+        let addr = spawn_pp_ignoring_backend().await.expect("backend starts");
+        let timeout = Duration::from_secs(2);
+
+        // The regression condition: a plain proxy-protocol ping never gets an
+        // answer from a backend that drops wrapped pings.
+        let direct = ping("127.0.0.1:0", addr.as_str(), true, timeout).await;
+        assert!(direct.is_err(), "wrapped ping should be dropped");
+
+        // With the fallback, the same backend is reachable again.
+        let motd = ping_with_fallback("127.0.0.1:0", &addr, true, timeout)
+            .await
+            .expect("fallback ping succeeds against PP-ignoring backend");
+        assert_eq!(motd.server_uuid, 42);
+    }
+
+    #[tokio::test]
+    async fn plain_ping_still_works_without_proxy_protocol() {
+        let addr = spawn_pp_ignoring_backend().await.expect("backend starts");
+        let timeout = Duration::from_secs(2);
+        let motd = ping_with_fallback("127.0.0.1:0", &addr, false, timeout)
+            .await
+            .expect("raw ping succeeds");
+        assert_eq!(motd.server_uuid, 42);
     }
 }

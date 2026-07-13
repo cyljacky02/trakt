@@ -78,7 +78,7 @@ impl HealthController {
     /// Performs a health check on server.
     async fn check_health(local_addr: String, proxy_protocol: bool, server: Arc<BackendServer>) {
         let timeout = Duration::from_secs(5);
-        let success = ping::ping(&local_addr, &server.addr, proxy_protocol, timeout)
+        let success = ping::ping_with_fallback(&local_addr, &server.addr, proxy_protocol, timeout)
             .await
             .is_ok();
         let mut health = server.health.write().await;
