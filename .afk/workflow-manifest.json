@@ -7,6 +7,14 @@
   },
   "artifacts": [
     {
+      "path": ".afk/runtime-lock.json",
+      "management": "managed",
+      "provenance": {
+        "source": "create-afk-workflow@0.1.0",
+        "baselineSha256": "a96db72d64bc7ae53602c82012506513771066959240921147b0ead2e923170c"
+      }
+    },
+    {
       "path": "AGENTS.md",
       "management": "managed",
       "provenance": {

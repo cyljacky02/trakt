@@ -1,3 +1,7 @@
 /target
 config.toml
 .trakt_recover
+
+# AFK isolated runtime (git-ignored cache/workspace installs)
+.afk/cache/
+.afk/workspace/node_modules/

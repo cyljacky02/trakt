@@ -1,0 +1,20 @@
+{
+  "lockVersion": 1,
+  "engine": {
+    "id": "create-afk-workflow",
+    "protocolVersion": 1,
+    "version": "0.1.0",
+    "integritySha256": "90c772016d87b98b604404047d47f74576da395b344e63108bb6cc7d3bbcd8e2"
+  },
+  "compatibilityProfile": {
+    "id": "cargo-v1",
+    "version": 1
+  },
+  "projectAdapter": {
+    "id": "cargo",
+    "version": "0.1.0",
+    "integritySha256": "90c772016d87b98b604404047d47f74576da395b344e63108bb6cc7d3bbcd8e2",
+    "configurationSha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+  },
+  "runtimeDependencies": []
+}

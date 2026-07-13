@@ -1,0 +1,9 @@
+{
+  "name": "afk-toolchain-workspace",
+  "private": true,
+  "description": "Isolated AFK toolchain dependencies; not the target application's package graph.",
+  "engine": {
+    "id": "create-afk-workflow",
+    "version": "0.1.0"
+  }
+}
