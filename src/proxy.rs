@@ -206,7 +206,7 @@ impl RaknetProxy {
         let mut per_server = HashMap::new();
         let mut client_count = 0;
         let mut connected_count = 0;
-        for (_, client) in clients.iter() {
+        for client in clients.values() {
             let server_load = per_server.entry(client.server.addr).or_default();
             *server_load += 1;
             client_count += 1;
