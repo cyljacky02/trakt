@@ -1,0 +1,2 @@
+# AFK sandboxes bind-mount host worktrees into Linux containers. Keep Git's view identical on both sides.
+* text=auto eol=lf
