@@ -1,0 +1,26 @@
+{
+  "manifestVersion": 1,
+  "engine": {
+    "id": "create-afk-workflow",
+    "protocolVersion": 1,
+    "version": "0.1.0"
+  },
+  "artifacts": [
+    {
+      "path": "AGENTS.md",
+      "management": "managed",
+      "provenance": {
+        "source": "create-afk-workflow@0.1.0",
+        "baselineSha256": "6474eb80c590a8cadb78f87b813a1b61674f49e1a4b48d3c348b10f3af8b6222"
+      }
+    },
+    {
+      "path": "CONTEXT.md",
+      "management": "managed",
+      "provenance": {
+        "source": "create-afk-workflow@0.1.0",
+        "baselineSha256": "face0bf2f7691f134e3239ceb08a9beb906164e9175cc6a18037c1130c1c8f02"
+      }
+    }
+  ]
+}
